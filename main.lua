@@ -99,8 +99,7 @@ local function validPayload(payload)
         and payload.hitokoto:match("%S") ~= nil and #payload.hitokoto <= 8192
 end
 
-local function loadCache(dir, date)
-    local raw = readFile(dir .. date .. ".json")
+local function decodeCache(raw, date)
     if not raw then return nil end
     local ok, cached = pcall(json.decode, raw)
     if ok and type(cached) == "table" and cached.date == date
@@ -110,9 +109,38 @@ local function loadCache(dir, date)
     end
 end
 
+local function loadCache(dir, date)
+    return decodeCache(readFile(dir .. date .. ".json"), date)
+end
+
 local function saveCache(dir, cached)
     local ok, raw = pcall(json.encode, cached)
     return ok and type(raw) == "string" and writeAtomic(dir .. cached.date .. ".json", raw)
+end
+
+local function loadStagedCache(dir, date)
+    local marker = dir .. date .. ".attempt"
+    if lfs.symlinkattributes(marker, "mode") ~= "file" then return end
+    local attempt = readFile(marker)
+    local name = attempt and attempt:match("^" .. date .. "\n(%.yiyan%-work%-%d+%-%d+)\n$")
+    if not name then return end
+    local work_dir = dir .. name
+    local path = work_dir .. "/data"
+    if lfs.symlinkattributes(work_dir, "mode") ~= "directory"
+        or lfs.symlinkattributes(path, "mode") ~= "file" then return end
+    local raw = readFile(path)
+    local record = decodeCache(raw, date)
+    if record and record.owner == CACHE_OWNER then return record, path, work_dir, raw end
+end
+
+local function encodeResponse(raw, date)
+    local ok, payload = pcall(json.decode, raw)
+    if not ok or not validPayload(payload) then return nil end
+    return json.encode{ date = date, owner = CACHE_OWNER, payload = { hitokoto = payload.hitokoto,
+        from = type(payload.from) == "string" and payload.from or "",
+        from_who = type(payload.from_who) == "string" and payload.from_who or "",
+        type = type(payload.type) == "string" and payload.type or nil,
+        uuid = type(payload.uuid) == "string" and payload.uuid or nil } }
 end
 
 local function readCategories()
@@ -171,30 +199,60 @@ local function publishWallpaper(dir, path)
     return writeAtomic(target, data)
 end
 
-local function ownsScreensaver(backup, dir)
+local function matchesArchivedImage(path, cached)
+    if not cached or (not cached.owner and not cached.image_digest) then return true end
+    local image = lfs.symlinkattributes(path, "mode") == "file" and readFile(path)
+    return image and md5(image) == cached.image_digest
+end
+
+local function knownBackup(backup)
+    return type(backup) == "table" and (backup.version == 1 or backup.version == 2)
+end
+
+local function ownsScreensaverDir(backup, dir)
     local current_dir = G_reader_settings:readSetting("screensaver_dir")
-    if G_reader_settings:readSetting("screensaver_type") ~= "random_image" then return false end
     if backup.applied_dir then return current_dir == backup.applied_dir end
     -- Older backups did not record the directory the plugin applied.
     return current_dir == screensaverDir(dir) or current_dir == dir
+end
+
+local function matchesSnapshot(key, saved)
+    if type(saved) ~= "table" then return false end
+    local value = G_reader_settings:readSetting(key)
+    if saved.is_set then return value == saved.value end
+    return value == nil
 end
 
 local function configureScreensaver(dir, previous_dir)
     local display_dir = screensaverDir(dir)
     local settings = G_reader_settings
     local backup = settings:readSetting(SETTING_BACKUP)
-    if type(backup) == "table" and backup.version == 1 then
-        -- A manual change of mode or directory supersedes our settings.
-        if not ownsScreensaver(backup, previous_dir or dir) then return false end
+    if knownBackup(backup) and settings:readSetting("screensaver_type") == "random_image"
+        and ownsScreensaverDir(backup, previous_dir or dir) then
         if settings:readSetting("screensaver_dir") == display_dir and backup.applied_dir then
+            if backup.version == 1 then
+                backup.version = 2
+                settings:saveSetting(SETTING_BACKUP, backup)
+                settings:flush()
+            end
             return true
         end
         if not Wallpaper.isValidPNG(display_dir .. "wallpaper.png") then return false end
         backup.applied_dir = display_dir
+        backup.version = 2
         settings:saveSetting(SETTING_BACKUP, backup)
         settings:saveSetting("screensaver_dir", display_dir)
         settings:flush()
         return true
+    end
+    if knownBackup(backup) then
+        -- Old builds saved the backup separately. Resume that unfinished apply
+        -- only when all four settings still match the original snapshot.
+        if backup.version ~= 1 or not backup.applied_dir
+            or not matchesSnapshot("screensaver_type", backup.type)
+            or not matchesSnapshot("screensaver_dir", backup.dir)
+            or not matchesSnapshot("screensaver_stretch_images", backup.stretch)
+            or not matchesSnapshot("screensaver_show_message", backup.show_message) then return false end
     end
 
     if not Wallpaper.isValidPNG(display_dir .. "wallpaper.png") then return false end
@@ -203,7 +261,7 @@ local function configureScreensaver(dir, previous_dir)
         return { is_set = value ~= nil, value = value }
     end
     backup = {
-        version = 1,
+        version = 2,
         applied_dir = display_dir,
         type = snapshot("screensaver_type"),
         dir = snapshot("screensaver_dir"),
@@ -211,7 +269,6 @@ local function configureScreensaver(dir, previous_dir)
         show_message = snapshot("screensaver_show_message"),
     }
     settings:saveSetting(SETTING_BACKUP, backup)
-    settings:flush()
     settings:saveSetting("screensaver_type", "random_image")
     settings:saveSetting("screensaver_dir", display_dir)
     settings:saveSetting("screensaver_stretch_images", true)
@@ -223,17 +280,21 @@ end
 local function restoreScreensaver(disable_auto)
     local settings = G_reader_settings
     local backup = settings:readSetting(SETTING_BACKUP)
-    local owned = type(backup) == "table" and backup.version == 1 and ownsScreensaver(backup, SAVE_DIR)
-    if owned then
+    local restored = false
+    if knownBackup(backup) then
         local function restore(key, saved)
-            if type(saved) ~= "table" or not saved.is_set then
+            if type(saved) ~= "table" or matchesSnapshot(key, saved) then return end
+            if not saved.is_set then
                 settings:delSetting(key)
             else
                 settings:saveSetting(key, saved.value)
             end
+            restored = true
         end
-        restore("screensaver_type", backup.type)
-        restore("screensaver_dir", backup.dir)
+        if settings:readSetting("screensaver_type") == "random_image" then
+            restore("screensaver_type", backup.type)
+        end
+        if ownsScreensaverDir(backup, SAVE_DIR) then restore("screensaver_dir", backup.dir) end
         if settings:readSetting("screensaver_stretch_images") == true then
             restore("screensaver_stretch_images", backup.stretch)
         end
@@ -242,12 +303,9 @@ local function restoreScreensaver(disable_auto)
         end
     end
     if disable_auto then settings:saveSetting(SETTING_AUTO, false) end
-    if owned or disable_auto then settings:flush() end
-    if backup ~= nil then
-        settings:delSetting(SETTING_BACKUP)
-        settings:flush()
-    end
-    return owned
+    if backup ~= nil then settings:delSetting(SETTING_BACKUP) end
+    if backup ~= nil or disable_auto then settings:flush() end
+    return restored
 end
 
 function Yiyan:init()
@@ -293,63 +351,60 @@ function Yiyan:stopPlugin()
     restoreScreensaver(false)
 end
 
-function Yiyan:requestSentence(dir, date, callback)
-    if active_worker then
-        callback(nil, "busy")
-        return
-    end
-    local response_path, work_dir = stageFile(dir .. date .. ".response")
-    if not response_path then
-        callback(nil, "write_error")
-        return
-    end
+function Yiyan:requestSentence(date, response_path, work_dir, callback)
     local url = requestURL()
-    local pid, read_fd
-    local started, start_err = pcall(function()
-        pid, read_fd = ffiutil.runInSubProcess(function(_, child_write_fd)
-            local result
-            local ok = pcall(function()
-                socketutil:set_timeout(HTTP_TIMEOUT, HTTP_TIMEOUT)
-                local chunks, response_size = {}, 0
-                -- The scheduler or a slow fork can carry the task across midnight.
-                if todayDate() ~= date then
-                    result = "ERR\nstale_date"
-                    return
-                end
-                local request_ok, code = http.request{
-                    url = url,
-                    method = "GET",
-                    headers = { ["User-Agent"] = "KOReader-yiyan.koplugin/1.2.2" },
-                    redirect = false,
-                    sink = function(chunk, sink_err)
-                        if sink_err then return nil, sink_err end
-                        if chunk then
-                            response_size = response_size + #chunk
-                            if response_size > 65536 then return nil, "response_too_large" end
-                            chunks[#chunks + 1] = chunk
-                        end
-                        return 1
-                    end,
-                }
-                if not request_ok then
-                    result = "ERR\nnetwork_error"
-                elseif tonumber(code) ~= 200 then
-                    result = "ERR\nhttp_" .. tostring(code or "unknown")
+    local partial = response_path .. ".partial"
+    local started, pid, read_fd = pcall(ffiutil.runInSubProcess, function(_, child_write_fd)
+        local result
+        local ok = pcall(function()
+            socketutil:set_timeout(HTTP_TIMEOUT, HTTP_TIMEOUT)
+            local chunks, response_size = {}, 0
+            -- The scheduler or a slow fork can carry the task across midnight.
+            if todayDate() ~= date then
+                result = "ERR\nstale_date"
+                return
+            end
+            local request_ok, code = http.request{
+                url = url,
+                method = "GET",
+                headers = { ["User-Agent"] = "KOReader-yiyan.koplugin/1.2.3" },
+                redirect = false,
+                sink = function(chunk, sink_err)
+                    if sink_err then return nil, sink_err end
+                    if chunk then
+                        response_size = response_size + #chunk
+                        if response_size > 65536 then return nil, "response_too_large" end
+                        chunks[#chunks + 1] = chunk
+                    end
+                    return 1
+                end,
+            }
+            if not request_ok then
+                result = "ERR\nnetwork_error"
+            elseif tonumber(code) ~= 200 then
+                result = "ERR\nhttp_" .. tostring(code or "unknown")
+            else
+                local record = encodeResponse(table.concat(chunks), date)
+                if type(record) ~= "string" then
+                    result = "ERR\ninvalid_response"
+                elseif writeFile(partial, record) and os.rename(partial, response_path) then
+                    -- The marker points to this complete cache even after a
+                    -- restart. Only the status needs to go through the pipe.
+                    result = "ok"
                 else
-                    -- Only send a small status through the pipe. The parent
-                    -- waits for exit before reading it; a full JSON pipe could
-                    -- otherwise block the child before it can exit.
-                    result = writeFile(response_path, table.concat(chunks)) and "ok" or "ERR\nwrite_error"
+                    result = "ERR\nwrite_error"
                 end
-            end)
-            if not ok then result = "ERR\nnetwork_error" end
-            ffiutil.writeToFD(child_write_fd, result or "ERR\nnetwork_error", true)
-        end, true)
-    end)
+            end
+        end)
+        if not ok then result = "ERR\nnetwork_error" end
+        ffiutil.writeToFD(child_write_fd, result or "ERR\nnetwork_error", true)
+    end, true)
     if not started or not pid then
-        discardStage(response_path, work_dir)
-        logger.warn("Yiyan: cannot start request worker", tostring(start_err or read_fd))
-        callback(nil, "network_error")
+        -- A normal failure return confirms no child started. An exception in a
+        -- KOReader fork hook may occur after fork, so retain the attempt then.
+        if started then discardStage(response_path, work_dir) end
+        logger.warn("Yiyan: cannot start request worker", tostring(read_fd or pid))
+        callback(false, started and "not_started" or "network_error")
         return
     end
 
@@ -373,25 +428,23 @@ function Yiyan:requestSentence(dir, date, callback)
         active_worker = nil
         UIManager:allowStandby()
         local read_ok, response = pcall(ffiutil.readAllFromFD, read_fd)
-        local raw = not worker.cancelled and not worker.timed_out and response == "ok" and readFile(response_path)
-        discardStage(response_path, work_dir)
+        os.remove(partial)
         if worker.cancelled then
+            discardStage(response_path, work_dir)
             self._busy = false
             return
         end
+        if lfs.symlinkattributes(response_path, "mode") == "file" then
+            callback(true)
+            return
+        end
+        discardStage(response_path, work_dir)
         if worker.timed_out then
-            callback(nil, "timeout")
-        elseif not read_ok or type(response) ~= "string" then
-            callback(nil, "network_error")
-        elseif response == "ok" and raw then
-            local decoded_ok, payload = pcall(json.decode, raw)
-            if decoded_ok and validPayload(payload) then
-                callback(payload)
-            else
-                callback(nil, "invalid_response")
-            end
+            callback(false, "timeout")
+        elseif read_ok and type(response) == "string" then
+            callback(false, response:match("^ERR\n(.*)") or "network_error")
         else
-            callback(nil, response:match("^ERR\n(.*)") or "network_error")
+            callback(false, "network_error")
         end
     end
     worker.cancel = function()
@@ -498,7 +551,24 @@ function Yiyan:refreshDaily(show_message, force_render, cache_only)
     local date = todayDate()
     local image_path = dir .. date .. ".png"
     local cache_path = dir .. date .. ".json"
+    local attempt_path = dir .. date .. ".attempt"
+
+    local function finishResponse()
+        local record, path, work_dir = loadStagedCache(dir, date)
+        if not record then return false end
+        if lfs.symlinkattributes(cache_path, "mode") or lfs.symlinkattributes(image_path, "mode") then
+            notify(_("发现同名文件，已保留原文件和今日句子，请移走冲突文件后重试"))
+        elseif not os.rename(path, cache_path) then
+            notify(_("句子已保留，请检查存储空间后离线重新生成"))
+        else
+            discardStage(path, work_dir)
+            if todayDate() == date then self:_renderCache(dir, record, image_path, show_message) end
+        end
+        return true
+    end
+
     local cached = loadCache(dir, date)
+    if not cached and finishResponse() then return end
     if not cached and lfs.attributes(cache_path, "mode") then
         notify(_("同名 JSON 无法识别为一言缓存，请移走后再生成"))
         return
@@ -506,6 +576,10 @@ function Yiyan:refreshDaily(show_message, force_render, cache_only)
     local valid_image = Wallpaper.isValidPNG(image_path)
     if valid_image and not force_render
         and (not cached or (not cached.pending_image and cached.layout_version == Wallpaper.VERSION)) then
+        if not matchesArchivedImage(image_path, cached) then
+            notify(_("同名图片无法确认归属，请移走后再重新生成"))
+            return
+        end
         local published = publishWallpaper(dir, image_path)
         if published and autoScreensaverEnabled() then configureScreensaver(dir) end
         notify(published and _("今日一言壁纸已存在") or _("图片已生成，但未能更新屏保文件"))
@@ -523,8 +597,8 @@ function Yiyan:refreshDaily(show_message, force_render, cache_only)
         notify(_("同名图片无法确认归属，请移走后再生成"))
         return
     end
-    if G_reader_settings:readSetting(SETTING_LAST_ATTEMPT) == date
-        or lfs.symlinkattributes(dir .. date .. ".attempt", "mode") then
+    local previous_attempt = G_reader_settings:readSetting(SETTING_LAST_ATTEMPT)
+    if previous_attempt == date or lfs.symlinkattributes(attempt_path, "mode") then
         notify(_("今天已请求过一言，明天再试"))
         return
     end
@@ -533,41 +607,38 @@ function Yiyan:refreshDaily(show_message, force_render, cache_only)
         return
     end
 
-    -- Persist the attempt before starting the child. If storage is unwritable,
-    -- do not send a request that the next startup might accidentally repeat.
-    if not writeAtomic(dir .. date .. ".attempt", date .. "\n") then
+    -- Reserve a private response path and persist the attempt before forking.
+    local response_path, work_dir = stageFile(attempt_path)
+    if not response_path then
+        notify(_("无法创建句子临时文件，请检查存储空间和目录权限"))
+        return
+    end
+    local attempt = date .. "\n" .. work_dir:match("[^/]+$") .. "\n"
+    if not writeAtomic(attempt_path, attempt) then
+        discardStage(response_path, work_dir)
         notify(_("无法保存请求记录，请检查存储空间和目录权限"))
         return
     end
     G_reader_settings:saveSetting(SETTING_LAST_ATTEMPT, date)
     G_reader_settings:flush()
     self._busy = true
-    self:requestSentence(dir, date, function(payload, err)
+    self:requestSentence(date, response_path, work_dir, function(received, err)
         self._busy = false
-        if err == "stale_date" then
-            notify(_("日期已切换，将按新日期检查壁纸"))
-            return
-        end
-        if not payload then
+        if err == "not_started" or err == "stale_date" then
+            -- Clear only the reservation we wrote, and only when the worker
+            -- confirmed that no request could have been made.
+            if readFile(attempt_path) == attempt and os.remove(attempt_path) then
+                G_reader_settings:saveSetting(SETTING_LAST_ATTEMPT, previous_attempt)
+                G_reader_settings:flush()
+            end
+            notify(err == "stale_date" and _("日期已切换，将按新日期检查壁纸")
+                or _("后台任务未能启动，可稍后重试"))
+        elseif not received then
             logger.warn("Yiyan: daily request failed", tostring(err))
             notify(_("今日一言请求失败；为避免重复请求，明天再试"))
-            return
+        elseif not finishResponse() then
+            notify(_("无法读取今日句子；为避免重复请求，明天再试"))
         end
-        if lfs.attributes(cache_path, "mode") or lfs.attributes(image_path, "mode") then
-            notify(_("请求期间出现同名文件，已保留原文件。今日请求额度已用完"))
-            return
-        end
-        local record = { date = date, owner = CACHE_OWNER, payload = { hitokoto = payload.hitokoto,
-            from = type(payload.from) == "string" and payload.from or "",
-            from_who = type(payload.from_who) == "string" and payload.from_who or "",
-            type = type(payload.type) == "string" and payload.type or nil,
-            uuid = type(payload.uuid) == "string" and payload.uuid or nil } }
-        if not saveCache(dir, record) then
-            notify(_("句子已返回，但缓存保存失败；请检查存储空间"))
-            return
-        end
-        local current_date = todayDate()
-        if current_date == date then self:_renderCache(dir, record, image_path, show_message) end
     end)
 end
 
@@ -605,10 +676,23 @@ function Yiyan:chooseOutputDirectory()
                         return
                     end
                     local date = todayDate()
+                    local _, _, _, staged_cache = loadStagedCache(old_dir, date)
+                    local staged_only = staged_cache and not loadCache(old_dir, date)
                     local copies = {}
                     for _, suffix in ipairs({ ".png", ".json", ".attempt" }) do
                         local name = date .. suffix
-                        local data = readFile(old_dir .. name)
+                        local data
+                        if staged_only then
+                            -- Save the staged sentence directly as the new cache.
+                            -- The source reservation points to a directory left behind.
+                            if suffix == ".json" then
+                                data = staged_cache
+                            elseif suffix == ".attempt" then
+                                data = date .. "\n"
+                            end
+                        else
+                            data = readFile(old_dir .. name)
+                        end
                         local existing = readFile(dir .. name)
                         if data and existing and data ~= existing then
                             UIManager:show(InfoMessage:new{ text = _("新目录已有不同的今日壁纸数据，请选择其他目录") })
@@ -626,7 +710,10 @@ function Yiyan:chooseOutputDirectory()
                         end
                     end
                     local image_path = dir .. date .. ".png"
-                    if not Wallpaper.isValidPNG(image_path) then
+                    local cached = loadCache(dir, date)
+                    if not Wallpaper.isValidPNG(image_path)
+                        or (cached and cached.pending_image)
+                        or not matchesArchivedImage(image_path, cached) then
                         image_path = screensaverDir(old_dir) .. "wallpaper.png"
                     end
                     if Wallpaper.isValidPNG(image_path) and not publishWallpaper(dir, image_path) then
@@ -679,7 +766,7 @@ function Yiyan:addToMainMenu(menu_items)
                 callback = function()
                     if autoScreensaverEnabled() then
                         local restored = restoreScreensaver(true)
-                        local message = restored and _("已关闭自动配置，原屏保设置已恢复")
+                        local message = restored and _("已关闭自动配置，已恢复插件修改的屏保设置")
                             or _("已关闭自动配置")
                         UIManager:show(InfoMessage:new{ text = message })
                     else

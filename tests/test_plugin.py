@@ -98,8 +98,10 @@ function text:new(t)
 end
 local ffi = {}
 function ffi.runInSubProcess(task)
+    if f.spawn_failed then return false, "fork failed" end
     f.done = not f.hung
     task(1, 1)
+    if f.spawn_hook_error then error("after-fork hook failed") end
     return 1, 1
 end
 function ffi.writeToFD(_, value) f.pipe = value end
@@ -181,7 +183,10 @@ for name, module in pairs(modules) do package.loaded[name] = module end
 local input = assert(io.open(test_root .. "/main.lua", "rb"))
 local source = input:read("*a"); input:close()
 source = source:gsub('local SAVE_DIR = "[^"]+"', 'local SAVE_DIR = ' .. string.format("%q", test_dir .. "/"))
-plugin = assert(loadstring(source, "@" .. test_root .. "/main.lua"))()
+function loadPlugin()
+    return assert(loadstring(source, "@" .. test_root .. "/main.lua"))()
+end
+plugin = loadPlugin()
 function newPlugin()
     return setmetatable({ path = test_root, ui = { menu = { registerToMainMenu = function() end } } }, { __index = plugin })
 end
@@ -298,6 +303,61 @@ class PluginTests(unittest.TestCase):
         self.obj = self.lua.globals().newPlugin()
         self.refresh()
         self.assertEqual(self.f.requests, 1)
+
+    def test_worker_start_failure_releases_unspent_attempt(self):
+        settings = self.f.settings.data
+        settings.yiyan_last_attempt_date = "20000101"
+        self.f.spawn_failed = True
+        self.refresh()
+        self.assertEqual(self.f.requests, 0)
+        self.assertIn("可稍后重试", self.f.message)
+        self.assertEqual(settings.yiyan_last_attempt_date, "20000101")
+        self.assertFalse((self.path / (self.date + ".attempt")).exists())
+        self.assertFalse(list(self.path.glob(".yiyan-work-*")))
+
+        self.f.spawn_failed = False
+        self.refresh()
+        self.refresh()
+        self.assertEqual(self.f.requests, 1)
+        self.assertTrue((self.path / (self.date + ".png")).exists())
+
+    def test_ambiguous_worker_start_error_keeps_attempt(self):
+        self.f.spawn_hook_error = True
+        self.f.http_error = True
+        self.refresh()
+        self.assertEqual(self.f.requests, 1)
+        self.assertTrue((self.path / (self.date + ".attempt")).exists())
+        self.f.spawn_hook_error = self.f.http_error = False
+        self.refresh()
+        self.assertEqual(self.f.requests, 1)
+
+    def test_received_sentence_survives_failed_cache_promotion_and_restart(self):
+        self.lua.execute(r'''
+            local rename = os.rename
+            os.rename = function(src, dst)
+                if f.fail_cache and dst:match("%d+%.json$") then return nil, "disk full" end
+                return rename(src, dst)
+            end
+        ''')
+        cache_path = self.path / (self.date + ".json")
+        self.f.fail_cache = True
+        self.refresh()
+        self.assertEqual(self.f.requests, 1)
+        self.assertIn("句子已保留", self.f.message)
+        self.assertFalse(cache_path.exists())
+        self.assertFalse(cache_path.with_suffix(".png").exists())
+        stages = list(self.path.glob(".yiyan-work-*/data"))
+        self.assertEqual(len(stages), 1)
+        self.assertEqual(json.loads(stages[0].read_text())["payload"]["hitokoto"], self.payload["hitokoto"])
+
+        self.lua.execute("plugin = loadPlugin(); obj = newPlugin()")
+        self.obj = self.lua.globals().obj
+        self.f.fail_cache, self.f.connected = False, False
+        self.refresh(True, True)
+        self.assertEqual(self.f.requests, 1)
+        self.assertEqual(json.loads(cache_path.read_text())["payload"]["hitokoto"], self.payload["hitokoto"])
+        self.assertTrue(cache_path.with_suffix(".png").exists())
+        self.assertFalse(list(self.path.glob(".yiyan-work-*")))
 
     def test_offline_check_does_not_consume_daily_attempt(self):
         self.f.connected = False
@@ -511,13 +571,13 @@ class PluginTests(unittest.TestCase):
         self.assertEqual((self.f.export_width, self.f.export_height), (758, 1024))
         self.assertEqual(self.f.requests, 0)
 
-    def test_directory_save_waits_for_active_request(self):
-        # The timer can start a request while the directory dialog is open.
+    def open_output_directory_dialog(self):
         new_path = self.path / "new-output"
         self.lua.globals().test_next_dir = str(new_path)
         self.lua.execute(r'''
             local function map(path)
                 local prefix = "/mnt/us/test/"
+                if path == "/mnt/us/test" then return test_next_dir end
                 if path:sub(1, #prefix) == prefix then
                     return test_next_dir .. "/" .. path:sub(#prefix + 1)
                 end
@@ -528,12 +588,13 @@ class PluginTests(unittest.TestCase):
             os.rename = function(src, dst) return rename(map(src), map(dst)) end
             os.remove = function(path) return remove(map(path)) end
             local lfs = package.loaded["libs/libkoreader-lfs"]
-            local attributes, symlinkattributes, mkdir, rmdir =
-                lfs.attributes, lfs.symlinkattributes, lfs.mkdir, lfs.rmdir
+            local attributes, symlinkattributes, mkdir, rmdir, list =
+                lfs.attributes, lfs.symlinkattributes, lfs.mkdir, lfs.rmdir, lfs.dir
             lfs.attributes = function(path, ...) return attributes(map(path), ...) end
             lfs.symlinkattributes = function(path, ...) return symlinkattributes(map(path), ...) end
             lfs.mkdir = function(path) return mkdir(map(path)) end
             lfs.rmdir = function(path) return rmdir(map(path)) end
+            lfs.dir = function(path) return list(map(path)) end
             package.loaded["util"].makePath = function(path)
                 py_mkdir(map(path))
                 return true
@@ -547,9 +608,13 @@ class PluginTests(unittest.TestCase):
                 return options
             end
             obj:chooseOutputDirectory()
-            obj:refreshDaily(true)
-            pending_save()
         ''')
+        return new_path
+
+    def test_directory_save_waits_for_active_request(self):
+        # The timer can start a request while the directory dialog is open.
+        new_path = self.open_output_directory_dialog()
+        self.lua.execute("obj:refreshDaily(true); pending_save()")
         self.assertIsNone(self.f.settings.data["yiyan_save_dir"])
         self.assertIn("请等待", self.f.message)
         self.f.drain(self.f)
@@ -563,6 +628,27 @@ class PluginTests(unittest.TestCase):
         self.assertEqual((new_path / ".yiyan-screen/wallpaper.png").read_bytes(), PNG)
         self.refresh()
         self.assertEqual(self.f.requests, 1)
+
+    def test_directory_migration_preserves_a_sentence_awaiting_cache_promotion(self):
+        new_path = self.open_output_directory_dialog()
+        self.lua.execute(r'''
+            local rename = os.rename
+            os.rename = function(src, dst)
+                if dst:sub(1, #test_dir) == test_dir and dst:match("%d+%.json$") then
+                    return nil, "unwritable old cache"
+                end
+                return rename(src, dst)
+            end
+        ''')
+        self.refresh()
+        self.assertFalse((self.path / (self.date + ".json")).exists())
+        self.lua.execute("pending_save()")
+        self.assertEqual(self.f.settings.data["yiyan_save_dir"], "/mnt/us/test/")
+        self.assertEqual((new_path / (self.date + ".attempt")).read_text(), self.date + "\n")
+        self.f.connected = False
+        self.refresh(True, True)
+        self.assertEqual(self.f.requests, 1)
+        self.assertEqual((new_path / ".yiyan-screen/wallpaper.png").read_bytes(), PNG)
 
     def test_foreign_cache_is_preserved_before_and_during_request(self):
         path = self.path / (self.date + ".json")
@@ -580,6 +666,10 @@ class PluginTests(unittest.TestCase):
         self.assertEqual(path.read_bytes(), original)
         self.assertEqual(self.f.requests, 1)
         self.assertFalse(path.with_suffix(".png").exists())
+        path.unlink()
+        self.refresh(True, True)
+        self.assertEqual(self.f.requests, 1)
+        self.assertTrue(path.with_suffix(".png").exists())
 
     def test_rebuild_does_not_overwrite_user_replacement(self):
         self.refresh()
@@ -588,6 +678,22 @@ class PluginTests(unittest.TestCase):
         self.refresh(True, True)
         self.assertEqual(path.read_bytes(), b"user replacement")
         self.assertEqual(self.f.requests, 1)
+
+    def test_normal_refresh_does_not_publish_valid_user_replacement(self):
+        self.refresh()
+        archive = self.path / (self.date + ".png")
+        display = self.path / ".yiyan-screen/wallpaper.png"
+        replacement = (ROOT / "docs/demo.png").read_bytes()
+        self.lua.globals().alternate_test_png = replacement
+        archive.write_bytes(replacement)
+        self.refresh()
+        self.assertIn("同名图片无法确认归属", self.f.message)
+        self.assertEqual(display.read_bytes(), PNG)
+        self.assertEqual(archive.read_bytes(), replacement)
+        self.assertEqual(self.f.requests, 1)
+        new_path = self.open_output_directory_dialog()
+        self.lua.execute("pending_save()")
+        self.assertEqual((new_path / ".yiyan-screen/wallpaper.png").read_bytes(), PNG)
 
     def test_refresh_preserves_foreign_temporary_files_and_directories(self):
         self.lua.globals().test_time = int(datetime(2026, 11, 4, 8, tzinfo=timezone.utc).timestamp())
@@ -691,6 +797,60 @@ class PluginTests(unittest.TestCase):
         self.assertEqual(settings["screensaver_type"], "readingprogress")
         self.assertEqual(settings["screensaver_dir"], "/mnt/us/my-wallpapers/")
         self.assertIsNone(settings["yiyan_screensaver_backup"])
+
+    def test_disabling_restores_only_screensaver_settings_the_plugin_still_owns(self):
+        settings = self.f.settings.data
+        settings.screensaver_type = "cover"
+        settings.screensaver_dir = "/mnt/us/original-wallpapers/"
+        settings.screensaver_stretch_images = False
+        settings.screensaver_show_message = True
+        self.refresh()
+        settings.screensaver_type = "readingprogress"
+        self.obj.stopPlugin(self.obj)
+        self.assertEqual(settings.screensaver_type, "readingprogress")
+        self.assertEqual(settings.screensaver_dir, "/mnt/us/original-wallpapers/")
+        self.assertFalse(settings.screensaver_stretch_images)
+        self.assertTrue(settings.screensaver_show_message)
+        self.assertIsNone(settings.yiyan_screensaver_backup)
+
+    def test_screensaver_backup_and_first_apply_are_saved_together(self):
+        self.cache()
+        self.lua.execute(r'''
+            function f.settings:flush()
+                f.flushes = (f.flushes or 0) + 1
+                assert(self.data.yiyan_screensaver_backup)
+                assert(self.data.screensaver_type == "random_image")
+                assert(self.data.screensaver_dir == self.data.yiyan_screensaver_backup.applied_dir)
+                assert(self.data.screensaver_stretch_images)
+                assert(self.data.screensaver_show_message == false)
+            end
+        ''')
+        self.refresh()
+        self.assertEqual(self.f.flushes, 1)
+
+    def test_incomplete_legacy_screensaver_apply_is_recovered(self):
+        settings = self.f.settings.data
+        settings.screensaver_type = "cover"
+        settings.screensaver_dir = "/mnt/us/original-wallpapers/"
+        settings.screensaver_show_message = True
+        display_dir = str(self.path / ".yiyan-screen") + "/"
+        settings.yiyan_screensaver_backup = self.to_lua({
+            "version": 1, "applied_dir": display_dir,
+            "type": {"is_set": True, "value": settings.screensaver_type},
+            "dir": {"is_set": True, "value": settings.screensaver_dir},
+            "stretch": {"is_set": False},
+            "show_message": {"is_set": True, "value": True},
+        })
+        self.cache()
+        self.refresh()
+        self.assertEqual(settings.screensaver_type, "random_image")
+        self.assertEqual(settings.screensaver_dir, display_dir)
+        self.assertEqual(settings.yiyan_screensaver_backup.version, 2)
+        self.obj.stopPlugin(self.obj)
+        self.assertEqual(settings.screensaver_type, "cover")
+        self.assertEqual(settings.screensaver_dir, "/mnt/us/original-wallpapers/")
+        self.assertIsNone(settings.screensaver_stretch_images)
+        self.assertTrue(settings.screensaver_show_message)
 
     def test_request_rechecks_beijing_date_inside_worker(self):
         self.lua.globals().review_clock = int(datetime(2026, 11, 4, 15, 59, 59, tzinfo=timezone.utc).timestamp())
