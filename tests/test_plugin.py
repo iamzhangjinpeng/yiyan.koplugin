@@ -17,7 +17,7 @@ BROKEN_PNG = b"\x89PNG\r\n\x1a\n" + b"fixture" * 4 + b"\0\0\0\0IEND\xaeB`\x82"
 
 MOCKS = r'''
 f = { queue = {}, requests = 0, renders = 0, live_widgets = 0, locks = 0,
-    paints = {}, now = 0, connected = true, settings = { data = {} } }
+    paints = {}, shapes = {}, now = 0, connected = true, settings = { data = {} } }
 function f.settings:readSetting(k) return self.data[k] end
 function f.settings:saveSetting(k, v) self.data[k] = v end
 function f.settings:delSetting(k) self.data[k] = nil end
@@ -48,7 +48,15 @@ function bb.new(w, h)
     function image:free() assert(not self.freed); self.freed = true end
     function image:blitFrom() end
     function image:ditherblitFrom() self.dithered = true end
-    function image:paintRect(_, y, _, h) assert(y + h == self.h) end
+    function image:paintRect(x, y, w, h, color)
+        assert(x >= 0 and y >= 0 and w > 0 and h > 0)
+        assert(x + w <= self.w and y + h <= self.h)
+        table.insert(f.shapes, { kind = "rect", x = x, y = y, w = w, h = h, color = color })
+    end
+    function image:paintCircle(x, y, radius, color)
+        assert(x - radius >= 0 and y - radius >= 0 and x + radius < self.w and y + radius < self.h)
+        table.insert(f.shapes, { kind = "circle", x = x, y = y, radius = radius, color = color })
+    end
     function image:writeToFile(path, format)
         assert(format == "png")
         assert(self.dithered, "export must use 16-tone e-ink dithering")
@@ -81,7 +89,8 @@ function text:new(t)
     end
     function t:paintTo(_, x, y)
         assert(self:getSize().h > 0)
-        table.insert(f.paints, { x = x, y = y, h = self:getSize().h,
+        table.insert(f.paints, { x = x, y = y, w = self.width, h = self:getSize().h,
+            size = self.face.size, bold = self.bold, line_height = self.line_height,
             fg = self.fgcolor, bg = self.bgcolor, text = self.text })
     end
     function t:free() assert(not self.freed); self.freed = true; f.live_widgets = f.live_widgets - 1 end
@@ -116,7 +125,9 @@ local modules = {
     ["ui/widget/infomessage"] = { new = function(_, t) return t end },
     ["ui/widget/inputdialog"] = {},
     ["ui/widget/textboxwidget"] = text,
-    ["ui/font"] = { getFace = function(_, _, size) return { size = size } end },
+    ["ui/font"] = { getFace = function(_, _, size)
+        return { size = math.ceil(size * (f.screen_scale or 1)) }
+    end },
     ["ffi/blitbuffer"] = bb,
     ["ffi"] = { C = { free = function(data) assert(data == "decoded") end } },
     ["ffi/png"] = { decodeFromFile = function(path, components)
@@ -139,6 +150,7 @@ local modules = {
     ["device"] = { screen = {
         getWidth = function() return f.screen_width or 758 end,
         getHeight = function() return f.screen_height or 1024 end,
+        scaleBySize = function(_, size) return math.ceil(size * (f.screen_scale or 1)) end,
     } },
     ["util"] = { makePath = function(path) py_mkdir(path); return true end },
     ["ffi/util"] = ffi,
@@ -215,7 +227,7 @@ class PluginTests(unittest.TestCase):
     def test_success_is_requested_only_once_even_after_settings_reset(self):
         self.refresh()
         self.assertTrue((self.path / (self.date + ".png")).exists())
-        self.assertEqual(json.loads((self.path / (self.date + ".json")).read_text())["layout_version"], 3)
+        self.assertEqual(json.loads((self.path / (self.date + ".json")).read_text())["layout_version"], 4)
         self.f.settings.data = self.lua.table()
         self.refresh()
         self.assertEqual(self.f.requests, 1)
@@ -267,7 +279,9 @@ class PluginTests(unittest.TestCase):
         self.assertEqual((body.bg, body.fg), ("white", "black"))
         self.assertLess(body.y + body.h, 700)
         self.assertEqual((source.bg, source.fg), ("black", "white"))
-        self.assertEqual(source.text, "一言 · 一言开发者中心")
+        self.assertEqual(source.text, "一言开发者中心")
+        self.assertTrue(source.bold)
+        self.assertEqual(date.text, f"一言  ·  {self.date[:4]}-{self.date[4:6]}-{self.date[6:]}")
         self.assertGreaterEqual(source.y, 922)
         self.assertLessEqual(date.y + date.h, 1024)
 
@@ -276,8 +290,24 @@ class PluginTests(unittest.TestCase):
         self.cache()
         self.refresh()
         source = self.f.paints[2]
-        self.assertLessEqual(source.h, 47)
+        self.assertLessEqual(source.h, 41)
         self.assertLess(source.y + source.h, self.f.paints[3].y)
+
+    def test_cassette_and_title_fit_on_a_high_resolution_screen(self):
+        self.f.screen_width, self.f.screen_height, self.f.screen_scale = 1440, 1920, 2.4
+        self.payload.update({"from": "一次长途旅行", "from_who": "作者"})
+        self.cache()
+        self.refresh()
+        footer, cassette = self.f.shapes[1], self.f.shapes[2]
+        body, title, metadata = [self.f.paints[i] for i in (1, 2, 3)]
+        self.assertEqual((body.x, cassette.x), (cassette.x, 161))
+        self.assertGreaterEqual(cassette.y, footer.y)
+        self.assertLess(cassette.x + cassette.w, title.x)
+        self.assertEqual(title.text, "一次长途旅行")
+        self.assertTrue(metadata.text.startswith("作者  ·  "))
+        self.assertLess(title.y + title.h, metadata.y)
+        self.assertLessEqual(metadata.y + metadata.h, 1920)
+        self.assertLessEqual(title.size, 40)
 
     def test_missing_artwork_preserves_previous_png_and_cached_sentence(self):
         target = self.path / (self.date + ".png")
