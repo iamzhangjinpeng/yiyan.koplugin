@@ -113,13 +113,19 @@ function ffi.copyFile(a, b)
     local out = assert(io.open(b, "wb")); out:write(data); out:close(); return true
 end
 local http = {}
+function http.open()
+    return { close = function() f.closed_connections = (f.closed_connections or 0) + 1 end }
+end
 function http.request(request)
+    local opened, connection = pcall(http.open)
+    if not opened then return nil, connection end
     f.requests = f.requests + 1
     f.request_url = request.url
     assert(request.method == "GET")
     assert(request.redirect == false, "a redirect must not spend another request")
     if f.http_error then return nil, "offline" end
     local ok, err = request.sink(f.raw_response)
+    connection:close()
     if not ok then return nil, err end
     return 1, f.http_code or 200
 end
@@ -212,6 +218,8 @@ class PluginTests(unittest.TestCase):
         g.py_encode = lambda v: json.dumps(self.to_python(v), ensure_ascii=False)
         g.py_decode = lambda s: self.to_lua(json.loads(s))
         self.lua.execute(MOCKS)
+        g.test_clock = int(datetime(2026, 11, 4, 8, tzinfo=timezone.utc).timestamp())
+        self.lua.execute("os.time = function() return test_clock end")
         self.f, self.obj = g.f, g.obj
         self.payload = {"hitokoto": "用代码表达言语的魅力，用代码书写山河的壮丽。", "from": "一言开发者中心", "from_who": "一言"}
         self.f.raw_response = json.dumps(self.payload, ensure_ascii=False)
@@ -249,7 +257,7 @@ class PluginTests(unittest.TestCase):
         self.refresh()
         self.assertEqual(self.f.request_url, "https://v1.hitokoto.cn/?encode=json&charset=utf-8")
         self.assertTrue((self.path / (self.date + ".png")).exists())
-        self.assertEqual(json.loads((self.path / (self.date + ".json")).read_text())["layout_version"], 5)
+        self.assertEqual(json.loads((self.path / (self.date + ".json")).read_text())["layout_version"], 6)
         self.f.settings.data = self.lua.table()
         self.refresh()
         self.assertEqual(self.f.requests, 1)
@@ -384,6 +392,17 @@ class PluginTests(unittest.TestCase):
         self.assertEqual(self.f.requests, 0)
         self.assertEqual(self.f.renders, 1)
 
+    def test_body_keeps_closing_marks_with_preceding_punctuation(self):
+        body = self.lua.globals().wallpaper.body
+        for quote, expected in (
+            ("她说：“明天见。”", "她说：“明天见。”"),
+            ("怎么可能？！我不信。", "怎么可能？！\n我不信。"),
+            ("「是真的！」她笑了。", "「是真的！」\n她笑了。"),
+            ("你好，\r\n朋友。", "你好，\n朋友。"),
+        ):
+            with self.subTest(quote=quote):
+                self.assertEqual(body(self.to_lua({"hitokoto": quote})), expected)
+
     def test_legacy_image_without_sentence_never_causes_another_request(self):
         (self.path / (self.date + ".png")).write_bytes(PNG)
         self.refresh(True)
@@ -507,6 +526,43 @@ class PluginTests(unittest.TestCase):
         self.assertFalse((self.path / ".yiyan-screen").exists())
         self.assertFalse(list(self.path.glob(".yiyan-work-*")))
 
+    def test_stop_revokes_response_even_if_restart_drops_poll(self):
+        self.f.hung = True
+        self.obj.refreshDaily(self.obj, True)
+        self.assertEqual(len(list(self.path.glob(".yiyan-work-*/data"))), 1)
+        self.obj.stopPlugin(self.obj)
+        self.assertEqual(self.f.kills, 1)
+        self.assertEqual(len(self.f.queue), 1)
+        marker = self.path / (self.date + ".attempt")
+        self.assertEqual(marker.read_text(), self.date + "\n")
+
+        self.lua.execute("f.queue = {}; f.locks = 0; plugin = loadPlugin(); obj = newPlugin()")
+        self.obj = self.lua.globals().obj
+        self.refresh()
+        self.assertEqual(self.f.requests, 1)
+        self.assertFalse(marker.with_suffix(".json").exists())
+        self.assertFalse((self.path / ".yiyan-screen").exists())
+
+    def test_stop_records_cancellation_if_attempt_marker_is_unwritable(self):
+        self.f.hung = True
+        self.obj.refreshDaily(self.obj, True)
+        marker = self.path / (self.date + ".attempt")
+        self.lua.execute(r'''
+            local open = io.open
+            io.open = function(path, mode)
+                if path:match("%.attempt$") and mode == "wb" then return nil, "unwritable" end
+                return open(path, mode)
+            end
+        ''')
+        self.obj.stopPlugin(self.obj)
+        self.assertIn(".yiyan-work-", marker.read_text())
+        self.assertEqual(self.f.settings.data.yiyan_attempt_history[self.date], "cancelled")
+        self.lua.execute("f.queue = {}; f.locks = 0; plugin = loadPlugin(); obj = newPlugin()")
+        self.obj = self.lua.globals().obj
+        self.refresh()
+        self.assertEqual(self.f.requests, 1)
+        self.assertFalse(marker.with_suffix(".json").exists())
+
     def test_ui_transition_cancels_previous_periodic_callback(self):
         self.f.settings.data["yiyan_auto_screensaver"] = False
         self.obj.init(self.obj)
@@ -629,6 +685,69 @@ class PluginTests(unittest.TestCase):
         self.refresh()
         self.assertEqual(self.f.requests, 1)
 
+    def test_directory_migration_reports_file_conflict(self):
+        self.refresh()
+        dest = self.open_output_directory_dialog()
+        dest.mkdir()
+        archive = dest / (self.date + ".png")
+        archive.write_bytes(b"other data")
+        self.lua.execute("pending_save()")
+        self.assertIn("新目录已有不同的今日壁纸数据", self.f.message)
+        self.assertIsNone(self.f.settings.data.yiyan_save_dir)
+        self.assertEqual(archive.read_bytes(), b"other data")
+
+    def test_directory_migration_reports_and_rolls_back_write_failure(self):
+        self.refresh()
+        dest = self.open_output_directory_dialog()
+        self.lua.execute(r'''
+            local rename = os.rename
+            os.rename = function(src, dst)
+                if dst:match("^/mnt/us/test/%d+%.json$") then return nil, "disk full" end
+                return rename(src, dst)
+            end
+            pending_save()
+        ''')
+        self.assertIn("无法复制今日壁纸数据", self.f.message)
+        self.assertIsNone(self.f.settings.data.yiyan_save_dir)
+        self.assertFalse(list(dest.iterdir()))
+        self.assertTrue((self.path / (self.date + ".png")).exists())
+
+    def test_directory_migration_rejects_foreign_cache_before_publication(self):
+        self.f.connected = False
+        dest = self.open_output_directory_dialog()
+        dest.mkdir()
+        archive = dest / (self.date + ".png")
+        archive.write_bytes(PNG)
+        foreign_cache = archive.with_suffix(".json")
+        foreign_cache.write_text('{"owner":"another application"}')
+        self.lua.execute("pending_save()")
+        self.assertIn("同名 JSON", self.f.message)
+        self.assertIsNone(self.f.settings.data.yiyan_save_dir)
+        self.assertIsNone(self.f.settings.data.screensaver_type)
+        self.assertFalse((dest / ".yiyan-screen").exists())
+        self.assertEqual(archive.read_bytes(), PNG)
+        self.assertEqual(foreign_cache.read_text(), '{"owner":"another application"}')
+
+    def test_directory_migration_and_clock_rollback_keep_daily_attempt_history(self):
+        self.refresh()
+        self.lua.execute("test_clock = test_clock + 86400")
+        self.refresh()
+        settings = self.f.settings.data
+        self.assertTrue(settings.yiyan_attempt_history["20261104"])
+        self.assertTrue(settings.yiyan_attempt_history["20261105"])
+        # Simulate an upgrade with only the legacy markers and last-attempt setting.
+        settings.yiyan_attempt_history = None
+        self.open_output_directory_dialog()
+        self.lua.execute("pending_save()")
+        self.assertEqual(settings.yiyan_save_dir, "/mnt/us/test/")
+        self.assertTrue(settings.yiyan_attempt_history["20261104"])
+        self.assertTrue(settings.yiyan_attempt_history["20261105"])
+
+        self.lua.execute("test_clock = test_clock - 86400")
+        self.refresh()
+        self.assertEqual(self.f.requests, 2)
+        self.assertIn("今天已请求过", self.f.message)
+
     def test_directory_migration_preserves_a_sentence_awaiting_cache_promotion(self):
         new_path = self.open_output_directory_dialog()
         self.lua.execute(r'''
@@ -722,7 +841,7 @@ class PluginTests(unittest.TestCase):
         cache = archive.with_suffix(".json")
         display = self.path / ".yiyan-screen/wallpaper.png"
         old_cache = json.loads(cache.read_text())
-        old_cache["layout_version"] = 4
+        old_cache["layout_version"] = 5
         new_png = (ROOT / "docs/demo.png").read_bytes()
         self.lua.globals().alternate_test_png = new_png
         self.f.invalid_png = new_png
@@ -761,7 +880,7 @@ class PluginTests(unittest.TestCase):
                 self.assertEqual(archive.read_bytes(), new_png)
                 self.assertEqual(display.read_bytes(), new_png)
                 recovered = json.loads(cache.read_text())
-                self.assertEqual(recovered["layout_version"], 5)
+                self.assertEqual(recovered["layout_version"], 6)
                 self.assertEqual(recovered["image_digest"], new_png.hex())
                 self.assertNotIn("pending_image", recovered)
                 self.assertEqual(self.f.renders - previous_renders, 0 if failure == "final_cache" else 1)
@@ -810,6 +929,20 @@ class PluginTests(unittest.TestCase):
         self.assertEqual(settings.screensaver_type, "readingprogress")
         self.assertEqual(settings.screensaver_dir, "/mnt/us/original-wallpapers/")
         self.assertFalse(settings.screensaver_stretch_images)
+        self.assertTrue(settings.screensaver_show_message)
+        self.assertIsNone(settings.yiyan_screensaver_backup)
+
+    def test_disabling_keeps_random_mode_for_manually_selected_folder(self):
+        settings = self.f.settings.data
+        settings.screensaver_type = "cover"
+        settings.screensaver_show_message = True
+        self.refresh()
+        settings.screensaver_dir = "/mnt/us/my-wallpapers/"
+        menu = self.lua.table()
+        self.obj.addToMainMenu(self.obj, menu)
+        menu.yiyan.sub_item_table[1].callback()
+        self.assertEqual(settings.screensaver_type, "random_image")
+        self.assertEqual(settings.screensaver_dir, "/mnt/us/my-wallpapers/")
         self.assertTrue(settings.screensaver_show_message)
         self.assertIsNone(settings.yiyan_screensaver_backup)
 
@@ -868,6 +1001,35 @@ class PluginTests(unittest.TestCase):
         self.refresh()
         self.assertEqual(self.f.requests, 1)
         self.assertTrue((self.path / "20261105.png").exists())
+        self.refresh()
+        self.assertEqual(self.f.requests, 1)
+
+    def test_connection_crossing_beijing_midnight_never_sends_old_day_request(self):
+        self.lua.globals().test_clock = int(datetime(2026, 11, 4, 15, 59, 35, tzinfo=timezone.utc).timestamp())
+        self.lua.execute(r'''
+            local http = package.loaded["socket.http"]
+            local open = http.open
+            http.open = function(...)
+                test_clock = test_clock + 26
+                return open(...)
+            end
+        ''')
+        self.refresh()
+        self.assertEqual(self.f.requests, 0)
+        self.assertEqual(self.f.closed_connections, 1)
+        self.assertFalse((self.path / "20261104.attempt").exists())
+        self.refresh()
+        self.refresh()
+        self.assertEqual(self.f.requests, 1)
+        self.assertTrue((self.path / "20261105.png").exists())
+
+    def test_request_is_deferred_inside_the_midnight_send_window(self):
+        self.lua.globals().test_clock = int(datetime(2026, 11, 4, 15, 59, 45, tzinfo=timezone.utc).timestamp())
+        self.refresh()
+        self.assertEqual(self.f.requests, 0)
+        self.assertIsNone(self.f.settings.data.yiyan_attempt_history[self.date])
+        self.assertFalse((self.path / (self.date + ".attempt")).exists())
+        self.lua.execute("test_clock = test_clock + 20")
         self.refresh()
         self.assertEqual(self.f.requests, 1)
 

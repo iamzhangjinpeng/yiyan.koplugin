@@ -9,7 +9,7 @@ local Font = require("ui/font")
 local Screen = require("device").screen
 local logger = require("logger")
 
-local Wallpaper = { VERSION = 5 }
+local Wallpaper = { VERSION = 6 }
 
 function Wallpaper.isValidPNG(path)
     local file = io.open(path, "rb")
@@ -84,15 +84,27 @@ local function paintDisc(image, disc)
     image:paintCircle(x, y, round(radius * 0.10), black)
 end
 
+local LINE_BREAK = { ["，"] = true, ["。"] = true, ["；"] = true, ["！"] = true, ["？"] = true }
+local LINE_BREAK_SUFFIX = {
+    ["”"] = true, ["’"] = true, ["」"] = true, ["』"] = true, ["》"] = true,
+    ["〉"] = true, ["）"] = true, ["】"] = true, ["〕"] = true, ["〗"] = true,
+    ['"'] = true, ["'"] = true, [")"] = true, ["]"] = true, ["}"] = true,
+    ["!"] = true, ["?"] = true, ["…"] = true,
+}
+
 function Wallpaper.body(payload)
     local text = payload.hitokoto:gsub("\r\n", "\n"):gsub("\r", "\n")
-    -- Keep the original punctuation while making Chinese phrases read like
-    -- lyric lines. The widget still wraps phrases that exceed the safe width.
-    for _, mark in ipairs({ "，", "。", "；", "！", "？" }) do
-        text = text:gsub(mark .. "\n*", mark .. "\n")
+    local parts, break_pending = {}, false
+    -- Match one UTF-8 character and keep punctuation clusters together.
+    for char in text:gmatch(".[\128-\191]*") do
+        if break_pending and not LINE_BREAK[char] and not LINE_BREAK_SUFFIX[char] then
+            if char ~= "\n" then parts[#parts + 1] = "\n" end
+            break_pending = false
+        end
+        parts[#parts + 1] = char
+        if LINE_BREAK[char] then break_pending = true end
     end
-    text = text:gsub("\n+$", "")
-    return text
+    return (table.concat(parts):gsub("\n+$", ""))
 end
 
 local function textInBox(text, box, is_footer)
