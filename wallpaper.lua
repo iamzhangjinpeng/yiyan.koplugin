@@ -1,6 +1,8 @@
 -- White lyric-poster layout. All measurements are physical pixels, scaled from
 -- the bundled 758x1024 template; text never overlaps the corner illustration.
 local Blitbuffer = require("ffi/blitbuffer")
+local ffi = require("ffi")
+local Png = require("ffi/png")
 local RenderImage = require("ui/renderimage")
 local TextBoxWidget = require("ui/widget/textboxwidget")
 local Font = require("ui/font")
@@ -18,7 +20,13 @@ function Wallpaper.isValidPNG(path)
         tail = file:read(12)
     end
     file:close()
-    return head == "\137PNG\r\n\26\n" and tail == "\0\0\0\0IEND\174\66\96\130"
+    if head ~= "\137PNG\r\n\26\n" or tail ~= "\0\0\0\0IEND\174\66\96\130" then
+        return false
+    end
+    local called, decoded, image = pcall(Png.decodeFromFile, path, 1)
+    if not called or not decoded then return false end
+    ffi.C.free(image.data)
+    return true
 end
 
 local function round(value) return math.floor(value + 0.5) end

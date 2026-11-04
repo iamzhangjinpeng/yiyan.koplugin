@@ -7,11 +7,13 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from datetime import datetime, timezone
 
 from lupa.lua51 import LuaRuntime
 
 ROOT = Path(__file__).resolve().parents[1]
-PNG = b"\x89PNG\r\n\x1a\n" + b"fixture" * 4 + b"\0\0\0\0IEND\xaeB`\x82"
+PNG = (ROOT / "assets/lyrics-background.png").read_bytes()
+BROKEN_PNG = b"\x89PNG\r\n\x1a\n" + b"fixture" * 4 + b"\0\0\0\0IEND\xaeB`\x82"
 
 MOCKS = r'''
 f = { queue = {}, requests = 0, renders = 0, live_widgets = 0, locks = 0,
@@ -52,7 +54,7 @@ function bb.new(w, h)
         assert(self.dithered, "export must use 16-tone e-ink dithering")
         if f.fail_render then return false end
         local out = assert(io.open(path, "wb"))
-        out:write(f.truncate_png and "truncated" or test_png)
+        out:write(f.invalid_png or (f.truncate_png and "truncated" or test_png))
         out:close()
         if f.fail_encode then return true, false, "disk full" end
         f.renders = f.renders + 1
@@ -116,6 +118,16 @@ local modules = {
     ["ui/widget/textboxwidget"] = text,
     ["ui/font"] = { getFace = function(_, _, size) return { size = size } end },
     ["ffi/blitbuffer"] = bb,
+    ["ffi"] = { C = { free = function(data) assert(data == "decoded") end } },
+    ["ffi/png"] = { decodeFromFile = function(path, components)
+        assert(components == 1)
+        local file = io.open(path, "rb")
+        if not file then return false end
+        local data = file:read("*a")
+        file:close()
+        if data == test_png then return true, { data = "decoded" } end
+        return false, "invalid PNG"
+    end },
     ["ui/renderimage"] = {
         renderImageFile = function(_, path)
             assert(path == test_root .. "/assets/lyrics-background.png")
@@ -406,6 +418,81 @@ class PluginTests(unittest.TestCase):
             name = self.date + suffix
             self.assertEqual((new_path / name).read_bytes(), (self.path / name).read_bytes())
         self.assertEqual((new_path / ".yiyan-screen/wallpaper.png").read_bytes(), PNG)
+        self.refresh()
+        self.assertEqual(self.f.requests, 1)
+
+    def test_foreign_cache_is_preserved_before_and_during_request(self):
+        path = self.path / (self.date + ".json")
+        original = b'{"application":"another plugin","data":"personal notes"}'
+        path.write_bytes(original)
+        self.refresh()
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(self.f.requests, 0)
+        self.assertFalse(path.with_suffix(".attempt").exists())
+
+        path.unlink()
+        self.obj.refreshDaily(self.obj, True)
+        path.write_bytes(original)
+        self.f.drain(self.f)
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(self.f.requests, 1)
+        self.assertFalse(path.with_suffix(".png").exists())
+
+    def test_rebuild_does_not_overwrite_user_replacement(self):
+        self.refresh()
+        path = self.path / (self.date + ".png")
+        path.write_bytes(b"user replacement")
+        self.refresh(True, True)
+        self.assertEqual(path.read_bytes(), b"user replacement")
+        self.assertEqual(self.f.requests, 1)
+
+    def test_undecodable_png_with_valid_header_and_tail_is_never_published(self):
+        display = self.path / ".yiyan-screen/wallpaper.png"
+        display.parent.mkdir()
+        display.write_bytes(PNG)
+        archive = self.path / (self.date + ".png")
+        archive.write_bytes(BROKEN_PNG)
+        self.refresh()
+        self.assertEqual(display.read_bytes(), PNG)
+        self.assertEqual(archive.read_bytes(), BROKEN_PNG)
+        self.assertEqual(self.f.requests, 0)
+
+        archive.write_bytes(PNG)
+        self.cache(2)
+        self.f.invalid_png = BROKEN_PNG
+        self.refresh()
+        self.assertEqual(archive.read_bytes(), PNG)
+        self.assertEqual(display.read_bytes(), PNG)
+
+    def test_periodic_refresh_and_disable_respect_manual_screensaver_change(self):
+        settings = self.f.settings.data
+        settings["screensaver_type"] = "cover"
+        self.refresh()
+        self.assertEqual(settings["screensaver_type"], "random_image")
+        settings["screensaver_type"] = "readingprogress"
+        settings["screensaver_dir"] = "/mnt/us/my-wallpapers/"
+        self.refresh()
+        self.obj.stopPlugin(self.obj)
+        self.assertEqual(settings["screensaver_type"], "readingprogress")
+        self.assertEqual(settings["screensaver_dir"], "/mnt/us/my-wallpapers/")
+        self.assertIsNone(settings["yiyan_screensaver_backup"])
+
+    def test_request_rechecks_beijing_date_inside_worker(self):
+        self.lua.globals().review_clock = int(datetime(2026, 11, 4, 15, 59, 59, tzinfo=timezone.utc).timestamp())
+        self.lua.execute(r'''
+            os.time = function() return review_clock end
+            local ffi = package.loaded["ffi/util"]
+            local spawn = ffi.runInSubProcess
+            ffi.runInSubProcess = function(...)
+                review_clock = review_clock + 1
+                return spawn(...)
+            end
+        ''')
+        self.refresh()
+        self.assertEqual(self.f.requests, 0)
+        self.refresh()
+        self.assertEqual(self.f.requests, 1)
+        self.assertTrue((self.path / "20261105.png").exists())
         self.refresh()
         self.assertEqual(self.f.requests, 1)
 

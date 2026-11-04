@@ -12,6 +12,7 @@ local http = require("socket.http")
 local socketutil = require("socketutil")
 local NetworkMgr = require("ui/network/manager")
 local logger = require("logger")
+local lfs = require("libs/libkoreader-lfs")
 local json = require("json")
 local md5 = require("ffi/sha2").md5
 local time = require("ui/time")
@@ -32,6 +33,7 @@ local SETTING_AUTO = "yiyan_auto_screensaver"
 local SETTING_BACKUP = "yiyan_screensaver_backup"
 local SETTING_LAST_ATTEMPT = "yiyan_last_attempt_date"
 local SETTING_SAVE_DIR = "yiyan_save_dir"
+local CACHE_OWNER = "yiyan.koplugin"
 
 local active_worker
 local active_instance
@@ -80,7 +82,9 @@ local function loadCache(dir, date)
     local raw = readFile(dir .. date .. ".json")
     if not raw then return nil end
     local ok, cached = pcall(json.decode, raw)
-    if ok and type(cached) == "table" and cached.date == date and validPayload(cached.payload) then
+    if ok and type(cached) == "table" and cached.date == date
+        and (cached.owner == nil or cached.owner == CACHE_OWNER)
+        and validPayload(cached.payload) then
         return cached
     end
 end
@@ -124,62 +128,83 @@ local function publishWallpaper(dir, path)
     return writeAtomic(target, data)
 end
 
-local function configureScreensaver(dir)
+local function ownsScreensaver(backup, dir)
+    local current_dir = G_reader_settings:readSetting("screensaver_dir")
+    if G_reader_settings:readSetting("screensaver_type") ~= "random_image" then return false end
+    if backup.applied_dir then return current_dir == backup.applied_dir end
+    -- Older backups did not record the directory the plugin applied.
+    return current_dir == screensaverDir(dir) or current_dir == dir
+end
+
+local function configureScreensaver(dir, previous_dir)
     local display_dir = screensaverDir(dir)
-    if not Wallpaper.isValidPNG(display_dir .. "wallpaper.png") then return false end
     local settings = G_reader_settings
-    if settings:readSetting(SETTING_BACKUP)
-        and settings:readSetting("screensaver_type") == "random_image"
-        and settings:readSetting("screensaver_dir") == display_dir
-        and settings:readSetting("screensaver_stretch_images") == true
-        and settings:readSetting("screensaver_show_message") == false then
+    local backup = settings:readSetting(SETTING_BACKUP)
+    if type(backup) == "table" and backup.version == 1 then
+        -- A manual change of mode or directory supersedes our settings.
+        if not ownsScreensaver(backup, previous_dir or dir) then return false end
+        if settings:readSetting("screensaver_dir") == display_dir and backup.applied_dir then
+            return true
+        end
+        if not Wallpaper.isValidPNG(display_dir .. "wallpaper.png") then return false end
+        backup.applied_dir = display_dir
+        settings:saveSetting(SETTING_BACKUP, backup)
+        settings:saveSetting("screensaver_dir", display_dir)
+        settings:flush()
         return true
     end
-    local backup = G_reader_settings:readSetting(SETTING_BACKUP)
-    if type(backup) ~= "table" or backup.version ~= 1 then
-        local function snapshot(key)
-            local value = G_reader_settings:readSetting(key)
-            return { is_set = value ~= nil, value = value }
-        end
-        backup = {
-            version = 1,
-            type = snapshot("screensaver_type"),
-            dir = snapshot("screensaver_dir"),
-            stretch = snapshot("screensaver_stretch_images"),
-            show_message = snapshot("screensaver_show_message"),
-        }
-        G_reader_settings:saveSetting(SETTING_BACKUP, backup)
-        G_reader_settings:flush()
+
+    if not Wallpaper.isValidPNG(display_dir .. "wallpaper.png") then return false end
+    local function snapshot(key)
+        local value = settings:readSetting(key)
+        return { is_set = value ~= nil, value = value }
     end
-    G_reader_settings:saveSetting("screensaver_type", "random_image")
-    G_reader_settings:saveSetting("screensaver_dir", display_dir)
-    G_reader_settings:saveSetting("screensaver_stretch_images", true)
-    G_reader_settings:saveSetting("screensaver_show_message", false)
-    G_reader_settings:flush()
+    backup = {
+        version = 1,
+        applied_dir = display_dir,
+        type = snapshot("screensaver_type"),
+        dir = snapshot("screensaver_dir"),
+        stretch = snapshot("screensaver_stretch_images"),
+        show_message = snapshot("screensaver_show_message"),
+    }
+    settings:saveSetting(SETTING_BACKUP, backup)
+    settings:flush()
+    settings:saveSetting("screensaver_type", "random_image")
+    settings:saveSetting("screensaver_dir", display_dir)
+    settings:saveSetting("screensaver_stretch_images", true)
+    settings:saveSetting("screensaver_show_message", false)
+    settings:flush()
     return true
 end
 
 local function restoreScreensaver(disable_auto)
-    local backup = G_reader_settings:readSetting(SETTING_BACKUP)
-    if type(backup) == "table" and backup.version == 1 then
+    local settings = G_reader_settings
+    local backup = settings:readSetting(SETTING_BACKUP)
+    local owned = type(backup) == "table" and backup.version == 1 and ownsScreensaver(backup, SAVE_DIR)
+    if owned then
         local function restore(key, saved)
             if type(saved) ~= "table" or not saved.is_set then
-                G_reader_settings:delSetting(key)
+                settings:delSetting(key)
             else
-                G_reader_settings:saveSetting(key, saved.value)
+                settings:saveSetting(key, saved.value)
             end
         end
         restore("screensaver_type", backup.type)
         restore("screensaver_dir", backup.dir)
-        restore("screensaver_stretch_images", backup.stretch)
-        restore("screensaver_show_message", backup.show_message)
+        if settings:readSetting("screensaver_stretch_images") == true then
+            restore("screensaver_stretch_images", backup.stretch)
+        end
+        if settings:readSetting("screensaver_show_message") == false then
+            restore("screensaver_show_message", backup.show_message)
+        end
     end
-    if disable_auto then G_reader_settings:saveSetting(SETTING_AUTO, false) end
-    G_reader_settings:flush()
+    if disable_auto then settings:saveSetting(SETTING_AUTO, false) end
+    if owned or disable_auto then settings:flush() end
     if backup ~= nil then
-        G_reader_settings:delSetting(SETTING_BACKUP)
-        G_reader_settings:flush()
+        settings:delSetting(SETTING_BACKUP)
+        settings:flush()
     end
+    return owned
 end
 
 function Yiyan:init()
@@ -238,10 +263,15 @@ function Yiyan:requestSentence(dir, date, callback)
             local ok = pcall(function()
                 socketutil:set_timeout(HTTP_TIMEOUT, HTTP_TIMEOUT)
                 local chunks, response_size = {}, 0
+                -- The scheduler or a slow fork can carry the task across midnight.
+                if todayDate() ~= date then
+                    result = "ERR\nstale_date"
+                    return
+                end
                 local request_ok, code = http.request{
                     url = "https://v1.hitokoto.cn/?encode=json",
                     method = "GET",
-                    headers = { ["User-Agent"] = "KOReader-yiyan.koplugin/1.1.1" },
+                    headers = { ["User-Agent"] = "KOReader-yiyan.koplugin/1.1.2" },
                     redirect = false,
                     sink = function(chunk, sink_err)
                         if sink_err then return nil, sink_err end
@@ -323,15 +353,25 @@ function Yiyan:renderImage(payload, date, target)
 end
 
 function Yiyan:_renderCache(dir, cached, image_path, show_message)
+    if lfs.attributes(image_path, "mode") then
+        local current = cached.image_digest and readFile(image_path)
+        local legacy = not cached.owner and (cached.layout_version == 1 or cached.layout_version == 2)
+        if not legacy and (not current or md5(current) ~= cached.image_digest) then
+            if show_message and not self._stopped then
+                UIManager:show(InfoMessage:new{ text = _("同名图片无法确认归属，请移走后再重新生成") })
+            end
+            return false
+        end
+    end
     local ok = self:renderImage(cached.payload, cached.date, image_path)
-    if not ok or not Wallpaper.isValidPNG(image_path) then
+    if not ok then
         if show_message and not self._stopped then
             UIManager:show(InfoMessage:new{ text = _("图片生成失败，句子已缓存，可稍后离线重新生成") })
         end
         return false
     end
     cached.layout_version = Wallpaper.VERSION
-    cached.owner = "yiyan.koplugin"
+    cached.owner = CACHE_OWNER
     local image = readFile(image_path)
     cached.image_digest = image and md5(image)
     local recorded = saveCache(dir, cached)
@@ -348,13 +388,12 @@ function Yiyan:_renderCache(dir, cached, image_path, show_message)
 end
 
 function Yiyan:cleanupOldImages(dir, keep_date)
-    local ok, lfs = pcall(require, "libs/libkoreader-lfs")
-    if not ok or lfs.attributes(dir, "mode") ~= "directory" then return end
+    if lfs.attributes(dir, "mode") ~= "directory" then return end
     for name in lfs.dir(dir) do
         local date = name:match("^(%d%d%d%d%d%d%d%d)%.json$")
         if date and date < keep_date then
             local cached = loadCache(dir, date)
-            if cached and cached.owner == "yiyan.koplugin" then
+            if cached and cached.owner == CACHE_OWNER then
                 local path = dir .. date .. ".png"
                 local image = cached.image_digest and readFile(path)
                 -- Leave legacy images and files replaced by the user alone.
@@ -375,7 +414,12 @@ function Yiyan:refreshDaily(show_message, force_render, cache_only)
     util.makePath(dir)
     local date = todayDate()
     local image_path = dir .. date .. ".png"
+    local cache_path = dir .. date .. ".json"
     local cached = loadCache(dir, date)
+    if not cached and lfs.attributes(cache_path, "mode") then
+        notify(_("同名 JSON 无法识别为一言缓存，请移走后再生成"))
+        return
+    end
     local valid_image = Wallpaper.isValidPNG(image_path)
     if valid_image and not force_render
         and (not cached or cached.layout_version == Wallpaper.VERSION) then
@@ -392,6 +436,10 @@ function Yiyan:refreshDaily(show_message, force_render, cache_only)
         return
     end
     if cache_only then notify(_("暂无今日句子缓存")); return end
+    if lfs.attributes(image_path, "mode") then
+        notify(_("同名图片无法确认归属，请移走后再生成"))
+        return
+    end
     if G_reader_settings:readSetting(SETTING_LAST_ATTEMPT) == date
         or fileExists(dir .. date .. ".attempt") then
         notify(_("今天已请求过一言，明天再试"))
@@ -413,12 +461,20 @@ function Yiyan:refreshDaily(show_message, force_render, cache_only)
     self._busy = true
     self:requestSentence(dir, date, function(payload, err)
         self._busy = false
+        if err == "stale_date" then
+            notify(_("日期已切换，将按新日期检查壁纸"))
+            return
+        end
         if not payload then
             logger.warn("Yiyan: daily request failed", tostring(err))
             notify(_("今日一言请求失败；为避免重复请求，明天再试"))
             return
         end
-        local record = { date = date, owner = "yiyan.koplugin", payload = { hitokoto = payload.hitokoto,
+        if lfs.attributes(cache_path, "mode") or lfs.attributes(image_path, "mode") then
+            notify(_("请求期间出现同名文件，已保留原文件。今日请求额度已用完"))
+            return
+        end
+        local record = { date = date, owner = CACHE_OWNER, payload = { hitokoto = payload.hitokoto,
             from = type(payload.from) == "string" and payload.from or "",
             from_who = type(payload.from_who) == "string" and payload.from_who or "",
             uuid = type(payload.uuid) == "string" and payload.uuid or nil } }
@@ -497,7 +553,7 @@ function Yiyan:chooseOutputDirectory()
                     SAVE_DIR = dir
                     G_reader_settings:saveSetting(SETTING_SAVE_DIR, dir)
                     G_reader_settings:flush()
-                    if autoScreensaverEnabled() then configureScreensaver(dir) end
+                    if autoScreensaverEnabled() then configureScreensaver(dir, old_dir) end
                 end
                 UIManager:close(dialog)
             end },
@@ -517,8 +573,10 @@ function Yiyan:addToMainMenu(menu_items)
                 checked_func = autoScreensaverEnabled,
                 callback = function()
                     if autoScreensaverEnabled() then
-                        restoreScreensaver(true)
-                        UIManager:show(InfoMessage:new{ text = _("已关闭自动配置，原屏保设置已恢复") })
+                        local restored = restoreScreensaver(true)
+                        local message = restored and _("已关闭自动配置，原屏保设置已恢复")
+                            or _("已关闭自动配置")
+                        UIManager:show(InfoMessage:new{ text = message })
                     else
                         setAutoScreensaver(true)
                         local ready = configureScreensaver(SAVE_DIR)
