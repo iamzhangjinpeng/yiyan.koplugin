@@ -271,7 +271,7 @@ function Yiyan:requestSentence(dir, date, callback)
                 local request_ok, code = http.request{
                     url = "https://v1.hitokoto.cn/?encode=json",
                     method = "GET",
-                    headers = { ["User-Agent"] = "KOReader-yiyan.koplugin/1.2.0" },
+                    headers = { ["User-Agent"] = "KOReader-yiyan.koplugin/1.2.1" },
                     redirect = false,
                     sink = function(chunk, sink_err)
                         if sink_err then return nil, sink_err end

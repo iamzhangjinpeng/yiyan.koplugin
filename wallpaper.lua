@@ -9,7 +9,7 @@ local Font = require("ui/font")
 local Screen = require("device").screen
 local logger = require("logger")
 
-local Wallpaper = { VERSION = 4 }
+local Wallpaper = { VERSION = 5 }
 
 function Wallpaper.isValidPNG(path)
     local file = io.open(path, "rb")
@@ -37,23 +37,24 @@ function Wallpaper.layout(width, height)
     local margin = round(width * 0.112)
     local footer_y = round(height * 0.90)
     local footer_height = height - footer_y
-    local icon_width = round(48 * scale)
-    local icon_height = round(32 * scale)
-    local text_x = margin + icon_width + round(16 * scale)
+    local disc_radius = round(56 * scale)
+    local text_inset = round(16 * scale)
+    local text_x = margin + 2 * disc_radius + text_inset
+    local text_width = width - text_inset - text_x
     return {
         body = { x = margin, y = round(height * 0.155), width = width - 2 * margin,
             height = round(height * 0.45), font_size = math.max(20, round(34 * scale)),
             min_size = math.max(14, round(18 * scale)) },
         footer = { y = footer_y, height = footer_height },
-        cassette = { x = margin, y = footer_y + round((footer_height - icon_height) / 2),
-            width = icon_width, height = icon_height },
+        disc = { x = margin + disc_radius, y = footer_y, radius = disc_radius },
         source = { x = text_x, y = footer_y + round(footer_height * 0.22),
-            width = width - margin - text_x, height = round(footer_height * 0.40),
+            width = text_width, height = round(footer_height * 0.40),
             font_size = math.max(15, round(20 * scale)), min_size = math.max(12, round(14 * scale)),
-            bold = true },
+            bold = true, alignment = "center" },
         date = { x = text_x, y = footer_y + round(footer_height * 0.65),
-            width = width - margin - text_x, height = round(footer_height * 0.27),
-            font_size = math.max(11, round(13 * scale)), min_size = math.max(10, round(11 * scale)) },
+            width = text_width, height = round(footer_height * 0.27),
+            font_size = math.max(11, round(13 * scale)), min_size = math.max(10, round(11 * scale)),
+            alignment = "center" },
     }
 end
 
@@ -69,24 +70,18 @@ function Wallpaper.source(payload)
     return "每日一句"
 end
 
-local function paintCassette(image, box)
-    local x, y, width, height = box.x, box.y, box.width, box.height
+local function paintDisc(image, disc)
+    local x, y, radius = disc.x, disc.y, disc.radius
     local white, black = Blitbuffer.COLOR_WHITE, Blitbuffer.COLOR_BLACK
-    local stroke = math.max(1, round(width / 24))
-    local radius = math.max(1, round(height * 0.15))
-    local reel_y = y + round(height * 0.41)
-    local left_reel = x + round(width * 0.30)
-    local right_reel = x + round(width * 0.70)
-
-    image:paintRect(x, y, width, height, white)
-    image:paintRect(x + stroke, y + stroke, width - 2 * stroke, height - 2 * stroke, black)
-    image:paintRect(left_reel, reel_y, right_reel - left_reel, stroke, white)
-    for _, reel_x in ipairs({ left_reel, right_reel }) do
-        image:paintCircle(reel_x, reel_y, radius, white)
-        image:paintCircle(reel_x, reel_y, math.max(1, radius - stroke), black)
-    end
-    local slot_width = round(width * 0.46)
-    image:paintRect(x + round((width - slot_width) / 2), y + round(height * 0.77), slot_width, stroke, white)
+    local rim = math.max(1, round(radius / 28))
+    local track = round(radius * 0.72)
+    -- The white rim keeps the lower half visible on the black footer.
+    image:paintCircle(x, y, radius, white)
+    image:paintCircle(x, y, radius - rim, black)
+    image:paintCircle(x, y, track, white)
+    image:paintCircle(x, y, track - math.max(1, round(radius / 56)), black)
+    image:paintCircle(x, y, round(radius * 0.27), white)
+    image:paintCircle(x, y, round(radius * 0.10), black)
 end
 
 function Wallpaper.body(payload)
@@ -112,7 +107,7 @@ local function textInBox(text, box, is_footer)
             width = box.width, bold = box.bold,
             height = at_minimum and box.height or nil,
             height_overflow_show_ellipsis = at_minimum,
-            alignment = "left", alignment_strict = true, auto_para_direction = true,
+            alignment = box.alignment or "left", alignment_strict = true, auto_para_direction = true,
             line_height = is_footer and 0.25 or 0.65,
             fgcolor = is_footer and Blitbuffer.COLOR_WHITE or Blitbuffer.COLOR_BLACK,
             bgcolor = is_footer and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_WHITE,
@@ -141,7 +136,7 @@ function Wallpaper.render(plugin_path, payload, date, target, width, height)
         -- Paint a precise black band after scaling so footer glyphs have a
         -- uniform background at every Kindle resolution.
         image:paintRect(0, layout.footer.y, width, layout.footer.height, Blitbuffer.COLOR_BLACK)
-        paintCassette(image, layout.cassette)
+        paintDisc(image, layout.disc)
         local function paint(text, box, footer)
             local widget = textInBox(text, box, footer)
             widgets[#widgets + 1] = widget

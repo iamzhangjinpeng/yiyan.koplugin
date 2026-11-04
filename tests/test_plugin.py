@@ -90,7 +90,7 @@ function text:new(t)
     function t:paintTo(_, x, y)
         assert(self:getSize().h > 0)
         table.insert(f.paints, { x = x, y = y, w = self.width, h = self:getSize().h,
-            size = self.face.size, bold = self.bold, line_height = self.line_height,
+            size = self.face.size, bold = self.bold, line_height = self.line_height, alignment = self.alignment,
             fg = self.fgcolor, bg = self.bgcolor, text = self.text })
     end
     function t:free() assert(not self.freed); self.freed = true; f.live_widgets = f.live_widgets - 1 end
@@ -227,7 +227,7 @@ class PluginTests(unittest.TestCase):
     def test_success_is_requested_only_once_even_after_settings_reset(self):
         self.refresh()
         self.assertTrue((self.path / (self.date + ".png")).exists())
-        self.assertEqual(json.loads((self.path / (self.date + ".json")).read_text())["layout_version"], 4)
+        self.assertEqual(json.loads((self.path / (self.date + ".json")).read_text())["layout_version"], 5)
         self.f.settings.data = self.lua.table()
         self.refresh()
         self.assertEqual(self.f.requests, 1)
@@ -293,16 +293,21 @@ class PluginTests(unittest.TestCase):
         self.assertLessEqual(source.h, 41)
         self.assertLess(source.y + source.h, self.f.paints[3].y)
 
-    def test_cassette_and_title_fit_on_a_high_resolution_screen(self):
+    def test_disc_straddles_footer_and_title_centers_in_remaining_space(self):
         self.f.screen_width, self.f.screen_height, self.f.screen_scale = 1440, 1920, 2.4
         self.payload.update({"from": "一次长途旅行", "from_who": "作者"})
         self.cache()
         self.refresh()
-        footer, cassette = self.f.shapes[1], self.f.shapes[2]
+        footer, disc = self.f.shapes[1], self.f.shapes[2]
         body, title, metadata = [self.f.paints[i] for i in (1, 2, 3)]
-        self.assertEqual((body.x, cassette.x), (cassette.x, 161))
-        self.assertGreaterEqual(cassette.y, footer.y)
-        self.assertLess(cassette.x + cassette.w, title.x)
+        self.assertEqual(disc.kind, "circle")
+        self.assertEqual(disc.x - disc.radius, body.x)
+        self.assertEqual(disc.y, footer.y)
+        self.assertLess(disc.y - disc.radius, footer.y)
+        self.assertLess(disc.y + disc.radius, 1920)
+        self.assertEqual(title.x - (disc.x + disc.radius), 1440 - (title.x + title.w))
+        self.assertEqual(title.alignment, "center")
+        self.assertEqual((title.x, title.w, title.alignment), (metadata.x, metadata.w, metadata.alignment))
         self.assertEqual(title.text, "一次长途旅行")
         self.assertTrue(metadata.text.startswith("作者  ·  "))
         self.assertLess(title.y + title.h, metadata.y)
