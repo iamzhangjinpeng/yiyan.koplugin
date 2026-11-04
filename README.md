@@ -53,9 +53,36 @@
 
 「重新生成今日图片（不联网）」只读取当天的句子缓存，可以反复使用。若从 1.0.0 升级且当天只有旧图片、没有 JSON 缓存，插件会保留旧图，第二天再获取新句子并应用新模板，避免当天重复请求。
 
-卸载前先关闭「自动配置 KOReader 屏保」，恢复原屏保设置，再退出 KOReader 并删除插件目录。
-
 插件通过 HTTPS 请求一言 API，并指定 UTF-8 JSON。分类使用重复的 `c` 参数，例如文学和诗词对应 `https://v1.hitokoto.cn/?encode=json&charset=utf-8&c=d&c=i`。壁纸使用返回的 `hitokoto`、`from`、`from_who` 和本地归档日期。插件负责配置 KOReader 睡眠屏保，不会修改 Kindle 原生锁屏文件。
+
+## 卸载与彻底清理
+
+### 卸载插件
+
+1. 在 KOReader 的「工具 → 一言壁纸」里关闭「自动配置 KOReader 屏保」。这会恢复仍由插件控制的屏保设置。若已经删掉插件，先在 KOReader 的睡眠屏保菜单里重新选择书籍封面等模式。若继续使用随机图片，请改选其他图片目录。
+2. 如果设置过自定义输出目录，先打开「设置屏保图片目录」记下路径，再完全退出 KOReader。
+3. 连接 Kindle 到电脑，删除 `/mnt/us/koreader/plugins/yiyan.koplugin/`。通过 USB 打开 Kindle 时，`/mnt/us/` 对应磁盘根目录。
+
+### 清理壁纸和缓存
+
+- **默认目录**为 `/mnt/us/koreader/screenshots/yiyan/`。确认其中只有一言生成的文件后，可以删除整个 `yiyan/` 目录。
+- **自定义目录**和以前用过的输出目录需要逐个检查。仅删除确认由一言生成的 `YYYYMMDD.png`（壁纸）、`YYYYMMDD.json`（句子缓存）、`YYYYMMDD.attempt`（请求记录）及遗留的 `.yiyan-work-*/` 临时目录。若用过旧版，也可以清理确认属于插件的同日期 `.tmp` 文件。
+- 每个输出目录里的 `.yiyan-screen/` 是插件的屏保目录，通常只有 `wallpaper.png`。确认里面没有个人文件后可删除整个目录。日期相同的个人图片和 JSON 应保留。
+
+### 清理 KOReader 设置记录（可选）
+
+完全退出 KOReader 后，先备份 `/mnt/us/koreader/settings.reader.lua`，再用纯文本编辑器删除以下插件字段（如有）。整个设置文件需要保留。
+
+```text
+yiyan_auto_screensaver
+yiyan_screensaver_backup
+yiyan_save_dir
+yiyan_categories
+yiyan_last_attempt_date
+yiyan_attempt_history
+```
+
+若在插件管理器里停用过一言，还可删除 `plugins_disabled` 表中单独的 `yiyan` 条目。若同目录存在 `settings.reader.lua.old`，可用相同方法清理其中的一言条目，保留其余设置。
 
 ## 效果预览
 
