@@ -247,8 +247,8 @@ class PluginTests(unittest.TestCase):
     def to_lua(self, value):
         return self.lua.table_from({k: self.to_lua(v) for k, v in value.items()}) if isinstance(value, dict) else value
 
-    def refresh(self, force=False, cache_only=False):
-        self.obj.refreshDaily(self.obj, True, force, cache_only)
+    def refresh(self, fetch_new=False):
+        self.obj.refreshDaily(self.obj, True, fetch_new)
         self.f.drain(self.f)
 
     def cache(self, version=None):
@@ -265,6 +265,89 @@ class PluginTests(unittest.TestCase):
         self.refresh()
         self.assertEqual(self.f.requests, 1)
         self.assertEqual(self.f.live_widgets, 0)
+
+    def test_manual_menu_requests_another_sentence_and_keeps_wallpaper_on_failure(self):
+        self.refresh()
+        cache = self.path / (self.date + ".json")
+        display = self.path / ".yiyan-screen/wallpaper.png"
+        old_cache = cache.read_bytes()
+        menu = self.lua.table()
+        self.obj.addToMainMenu(self.obj, menu)
+        entries = [item for _, item in menu.yiyan.sub_item_table.items() if "生成" in item.text]
+        self.assertEqual([item.text for item in entries], ["重新生成今日壁纸"])
+        self.f.http_error = True
+        entries[0].callback()
+        self.f.drain(self.f)
+        self.assertEqual(self.f.requests, 2)
+        self.assertEqual(cache.read_bytes(), old_cache)
+        self.assertEqual(display.read_bytes(), PNG)
+
+        self.refresh()
+        entries[0].callback()
+        self.f.drain(self.f)
+        self.assertEqual(self.f.requests, 2)
+        self.assertIn("手动重试", self.f.message)
+        self.lua.execute("test_clock = test_clock + 300")
+        new_png = (ROOT / "docs/demo.png").read_bytes()
+        self.lua.globals().alternate_test_png = self.f.invalid_png = new_png
+        self.f.raw_response = json.dumps({**self.payload, "hitokoto": "手动获取的新句子"})
+        self.f.http_error = False
+        entries[0].callback()
+        self.f.drain(self.f)
+        self.assertEqual(self.f.requests, 3)
+        self.assertEqual(json.loads(cache.read_text())["payload"]["hitokoto"], "手动获取的新句子")
+        self.assertEqual(display.read_bytes(), new_png)
+        self.refresh()
+        self.assertEqual(self.f.requests, 3)
+
+    def test_manual_response_recovers_after_cache_promotion_failure_and_restart(self):
+        self.refresh()
+        cache = self.path / (self.date + ".json")
+        display = self.path / ".yiyan-screen/wallpaper.png"
+        old_cache = cache.read_bytes()
+        self.f.raw_response = json.dumps({**self.payload, "hitokoto": "已暂存的新句子"})
+        self.lua.execute(r'''
+            local rename = os.rename
+            os.rename = function(src, dst)
+                if f.fail_cache and dst:match("%d+%.json$") then return nil, "disk full" end
+                return rename(src, dst)
+            end
+        ''')
+        self.f.fail_cache = True
+        self.refresh(True)
+        self.assertEqual(cache.read_bytes(), old_cache)
+        self.assertEqual(display.read_bytes(), PNG)
+        self.assertIn("新句子已收到", self.obj.networkDiagnostics(self.obj))
+        self.lua.execute("plugin = loadPlugin(); obj = newPlugin()")
+        self.obj = self.lua.globals().obj
+        self.f.connected = self.f.fail_cache = False
+        self.refresh()
+        self.assertEqual(self.f.requests, 2)
+        self.assertEqual(json.loads(cache.read_text())["payload"]["hitokoto"], "已暂存的新句子")
+        self.assertFalse(list(self.path.glob(".yiyan-work-*")))
+
+    def test_cancelled_manual_response_does_not_replace_cached_wallpaper_after_restart(self):
+        self.refresh()
+        cache = self.path / (self.date + ".json")
+        old_cache = cache.read_bytes()
+        self.f.hung = True
+        self.f.raw_response = json.dumps({**self.payload, "hitokoto": "被取消的句子"})
+        self.obj.refreshDaily(self.obj, True, True)
+        self.lua.execute(r'''
+            local rename = os.rename
+            os.rename = function(src, dst)
+                if dst:match("%.attempt$") then return nil, "unwritable" end
+                return rename(src, dst)
+            end
+        ''')
+        self.obj.stopPlugin(self.obj)
+        self.assertTrue(list(self.path.glob(".yiyan-work-*/data")))
+        self.lua.execute("f.queue = {}; f.locks = 0; plugin = loadPlugin(); obj = newPlugin()")
+        self.obj = self.lua.globals().obj
+        self.refresh()
+        self.refresh()
+        self.assertEqual(self.f.requests, 2)
+        self.assertEqual(cache.read_bytes(), old_cache)
 
     def test_diagnostics_menu_checks_wifi_without_sending_or_scheduling_requests(self):
         menu = self.lua.table()
@@ -304,7 +387,7 @@ class PluginTests(unittest.TestCase):
         complete = self.obj.networkDiagnostics(self.obj)
         self.assertIn("今日句子  已缓存", complete)
         self.assertIn("今日壁纸  已就绪", complete)
-        self.assertIn("今日无需再请求", complete)
+        self.assertIn("今日无需自动请求", complete)
         self.assertIn("最近请求  成功收到句子", complete)
         self.assertEqual(self.f.requests, 2)
 
@@ -479,7 +562,7 @@ class PluginTests(unittest.TestCase):
         self.lua.execute("plugin = loadPlugin(); obj = newPlugin()")
         self.obj = self.lua.globals().obj
         self.f.fail_cache, self.f.connected = False, False
-        self.refresh(True, True)
+        self.refresh()
         self.assertEqual(self.f.requests, 1)
         self.assertEqual(json.loads(cache_path.read_text())["payload"]["hitokoto"], self.payload["hitokoto"])
         self.assertTrue(cache_path.with_suffix(".png").exists())
@@ -504,7 +587,7 @@ class PluginTests(unittest.TestCase):
         self.refresh()
         self.assertTrue((self.path / (self.date + ".json")).exists())
         self.f.fail_render, self.f.connected = False, False
-        self.refresh(True, True)
+        self.refresh()
         self.assertEqual(self.f.requests, 1)
         self.assertTrue((self.path / (self.date + ".png")).exists())
 
@@ -528,7 +611,7 @@ class PluginTests(unittest.TestCase):
 
     def test_legacy_image_without_sentence_never_causes_another_request(self):
         (self.path / (self.date + ".png")).write_bytes(PNG)
-        self.refresh(True)
+        self.refresh()
         self.assertEqual(self.f.requests, 0)
         self.assertEqual(self.f.renders, 0)
 
@@ -960,7 +1043,7 @@ class PluginTests(unittest.TestCase):
         self.assertEqual(self.f.settings.data["yiyan_save_dir"], "/mnt/us/test/")
         self.assertEqual((new_path / (self.date + ".attempt")).read_text(), self.date + "\nsuccess\n")
         self.f.connected = False
-        self.refresh(True, True)
+        self.refresh()
         self.assertEqual(self.f.requests, 1)
         self.assertEqual((new_path / ".yiyan-screen/wallpaper.png").read_bytes(), PNG)
 
@@ -998,7 +1081,7 @@ class PluginTests(unittest.TestCase):
         self.assertEqual(self.f.requests, 1)
         self.assertFalse(path.with_suffix(".png").exists())
         path.unlink()
-        self.refresh(True, True)
+        self.refresh()
         self.assertEqual(self.f.requests, 1)
         self.assertTrue(path.with_suffix(".png").exists())
 
@@ -1006,7 +1089,7 @@ class PluginTests(unittest.TestCase):
         self.refresh()
         path = self.path / (self.date + ".png")
         path.write_bytes(b"user replacement")
-        self.refresh(True, True)
+        self.refresh()
         self.assertEqual(path.read_bytes(), b"user replacement")
         self.assertEqual(self.f.requests, 1)
 
@@ -1026,7 +1109,7 @@ class PluginTests(unittest.TestCase):
         self.lua.execute("pending_save()")
         self.assertEqual((new_path / ".yiyan-screen/wallpaper.png").read_bytes(), PNG)
         self.assertFalse((new_path / archive.name).exists())
-        self.refresh(True, True)
+        self.refresh()
         self.assertEqual((new_path / archive.name).read_bytes(), PNG)
         self.assertEqual(archive.read_bytes(), replacement)
         self.assertEqual(self.f.requests, 1)
