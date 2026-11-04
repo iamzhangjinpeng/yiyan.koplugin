@@ -590,8 +590,34 @@ class PluginTests(unittest.TestCase):
         self.assertFalse((self.path / "20000102.png").exists())
         self.assertFalse((self.path / "20000102.json").exists())
         self.assertEqual((self.path / "20000103.png").read_bytes(), b"user image")
+        self.assertTrue((self.path / "20000103.json").exists())
         display = self.path / ".yiyan-screen"
         self.assertEqual([p.name for p in display.iterdir()], ["wallpaper.png"])
+
+    def test_cleanup_does_not_allow_replaced_archive_to_be_published_after_clock_rollback(self):
+        self.refresh()
+        replacement = (ROOT / "docs/demo.png").read_bytes()
+        self.lua.globals().alternate_test_png = replacement
+        archive = self.path / (self.date + ".png")
+        archive.write_bytes(replacement)
+        self.lua.execute("test_clock = test_clock + 86400")
+        self.refresh()
+        self.assertTrue(archive.with_suffix(".json").exists())
+        self.lua.execute("test_clock = test_clock - 86400")
+        self.refresh()
+        self.assertIn("同名图片无法确认归属", self.f.message)
+        self.assertEqual((self.path / ".yiyan-screen/wallpaper.png").read_bytes(), PNG)
+        self.assertEqual(archive.read_bytes(), replacement)
+        self.assertEqual(self.f.requests, 2)
+
+    def test_cleanup_listing_failure_does_not_interrupt_publication(self):
+        self.lua.execute(r'''
+            package.loaded["libs/libkoreader-lfs"].dir = function() error("cannot open directory") end
+        ''')
+        self.refresh()
+        self.assertEqual(self.f.settings.data.screensaver_type, "random_image")
+        self.assertEqual((self.path / ".yiyan-screen/wallpaper.png").read_bytes(), PNG)
+        self.assertIn("已生成", self.f.message)
 
     def test_encoder_error_or_truncation_preserves_previous_png(self):
         target = self.path / (self.date + ".png")
@@ -728,6 +754,41 @@ class PluginTests(unittest.TestCase):
         self.assertEqual(archive.read_bytes(), PNG)
         self.assertEqual(foreign_cache.read_text(), '{"owner":"another application"}')
 
+    def test_directory_migration_leaves_foreign_source_data_in_place(self):
+        archive = self.path / (self.date + ".png")
+        archive.write_bytes(PNG)
+        cache = archive.with_suffix(".json")
+        cache.write_text('{"owner":"another application"}')
+        marker = archive.with_suffix(".attempt")
+        marker.write_text("unrelated data")
+        dest = self.open_output_directory_dialog()
+        self.lua.execute("pending_save()")
+        self.assertEqual(self.f.settings.data.yiyan_save_dir, "/mnt/us/test/")
+        self.assertEqual(list(dest.iterdir()), [])
+        self.assertEqual(archive.read_bytes(), PNG)
+        self.assertEqual(cache.read_text(), '{"owner":"another application"}')
+        self.assertEqual(marker.read_text(), "unrelated data")
+        self.refresh()
+        self.assertEqual(self.f.requests, 1)
+        self.assertTrue((dest / archive.name).exists())
+
+    def test_directory_migration_listing_failure_leaves_destination_untouched(self):
+        self.refresh()
+        dest = self.open_output_directory_dialog()
+        self.lua.execute(r'''
+            local lfs = package.loaded["libs/libkoreader-lfs"]
+            local list = lfs.dir
+            lfs.dir = function(path)
+                if path == test_dir .. "/" then error("cannot open directory") end
+                return list(path)
+            end
+            pending_save()
+        ''')
+        self.assertIn("无法读取原目录的请求记录", self.f.message)
+        self.assertIsNone(self.f.settings.data.yiyan_save_dir)
+        self.assertEqual(list(dest.iterdir()), [])
+        self.assertEqual((self.path / ".yiyan-screen/wallpaper.png").read_bytes(), PNG)
+
     def test_directory_migration_and_clock_rollback_keep_daily_attempt_history(self):
         self.refresh()
         self.lua.execute("test_clock = test_clock + 86400")
@@ -813,6 +874,11 @@ class PluginTests(unittest.TestCase):
         new_path = self.open_output_directory_dialog()
         self.lua.execute("pending_save()")
         self.assertEqual((new_path / ".yiyan-screen/wallpaper.png").read_bytes(), PNG)
+        self.assertFalse((new_path / archive.name).exists())
+        self.refresh(True, True)
+        self.assertEqual((new_path / archive.name).read_bytes(), PNG)
+        self.assertEqual(archive.read_bytes(), replacement)
+        self.assertEqual(self.f.requests, 1)
 
     def test_refresh_preserves_foreign_temporary_files_and_directories(self):
         self.lua.globals().test_time = int(datetime(2026, 11, 4, 8, tzinfo=timezone.utc).timestamp())

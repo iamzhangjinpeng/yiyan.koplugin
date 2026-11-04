@@ -135,9 +135,11 @@ local function attemptHistory()
 end
 
 local function rememberDirectoryAttempts(dir)
-    if lfs.attributes(dir, "mode") ~= "directory" then return end
+    if lfs.attributes(dir, "mode") ~= "directory" then return true end
+    local ok, entries, handle = pcall(lfs.dir, dir)
+    if not ok then return false end
     local history = attemptHistory()
-    for name in lfs.dir(dir) do
+    for name in entries, handle do
         local date = name:match("^(%d%d%d%d%d%d%d%d)%.attempt$")
         if date and not history[date] then
             local path = dir .. name
@@ -147,6 +149,7 @@ local function rememberDirectoryAttempts(dir)
         end
     end
     G_reader_settings:saveSetting(SETTING_ATTEMPT_HISTORY, history)
+    return true
 end
 
 local function loadStagedCache(dir, date)
@@ -237,6 +240,12 @@ local function matchesArchivedImage(path, cached)
     if not cached or (not cached.owner and not cached.image_digest) then return true end
     local image = lfs.symlinkattributes(path, "mode") == "file" and readFile(path)
     return image and md5(image) == cached.image_digest
+end
+
+local function matchesRecordedDigest(digest, cached)
+    local pending = cached.pending_image
+    return digest and (digest == cached.image_digest
+        or (type(pending) == "table" and digest == pending.digest))
 end
 
 local function knownBackup(backup)
@@ -418,7 +427,7 @@ function Yiyan:requestSentence(date, response_path, work_dir, callback)
             local request_ok, code = http.request{
                 url = url,
                 method = "GET",
-                headers = { ["User-Agent"] = "KOReader-yiyan.koplugin/1.2.4" },
+                headers = { ["User-Agent"] = "KOReader-yiyan.koplugin/1.2.5" },
                 redirect = false,
                 sink = function(chunk, sink_err)
                     if sink_err then return nil, sink_err end
@@ -579,19 +588,25 @@ end
 
 function Yiyan:cleanupOldImages(dir, keep_date)
     if lfs.attributes(dir, "mode") ~= "directory" then return end
-    for name in lfs.dir(dir) do
+    local ok, entries, handle = pcall(lfs.dir, dir)
+    if not ok then
+        logger.warn("Yiyan: could not list wallpaper directory", entries)
+        return
+    end
+    for name in entries, handle do
         local date = name:match("^(%d%d%d%d%d%d%d%d)%.json$")
         if date and date < keep_date then
             local cached = loadCache(dir, date)
             if cached and cached.owner == CACHE_OWNER then
                 local path = dir .. date .. ".png"
-                local image = lfs.symlinkattributes(path, "mode") == "file" and readFile(path)
-                -- Leave legacy images and files replaced by the user alone.
+                local mode = lfs.symlinkattributes(path, "mode")
+                local image = mode == "file" and readFile(path)
                 local digest = image and md5(image)
-                local pending = cached.pending_image
-                local owns_image = digest and (digest == cached.image_digest
-                    or (type(pending) == "table" and digest == pending.digest))
-                if not owns_image or os.remove(path) then os.remove(dir .. name) end
+                -- Keep the ownership record alongside a replacement. Without
+                -- it, a clock rollback could mistake the PNG for a legacy one.
+                if not mode or (matchesRecordedDigest(digest, cached) and os.remove(path)) then
+                    os.remove(dir .. name)
+                end
             end
         end
     end
@@ -756,7 +771,8 @@ function Yiyan:chooseOutputDirectory()
                         return
                     end
                     local staged = loadStagedCache(old_dir, date)
-                    local staged_only = staged and not loadCache(old_dir, date)
+                    local source_cache, source_conflict = loadCache(old_dir, date)
+                    local staged_only = staged and not source_cache
                     local copies = {}
                     for index, suffix in ipairs({ ".png", ".json", ".attempt" }) do
                         local name = date .. suffix
@@ -769,8 +785,18 @@ function Yiyan:chooseOutputDirectory()
                             elseif suffix == ".attempt" then
                                 data = date .. "\n"
                             end
-                        else
-                            data = readFile(old_dir .. name)
+                        elseif suffix == ".attempt" or not source_conflict then
+                            local source_path = old_dir .. name
+                            if lfs.symlinkattributes(source_path, "mode") == "file" then
+                                data = readFile(source_path)
+                            end
+                            if suffix == ".attempt" and not isAttemptMarker(date, data) then
+                                data = nil
+                            elseif suffix == ".png" and data then
+                                local recorded = source_cache and (source_cache.owner or source_cache.image_digest)
+                                if (recorded and not matchesRecordedDigest(md5(data), source_cache))
+                                    or not Wallpaper.isValidPNG(source_path) then data = nil end
+                            end
                         end
                         local target = dir .. name
                         local mode = lfs.symlinkattributes(target, "mode")
@@ -784,6 +810,10 @@ function Yiyan:chooseOutputDirectory()
                         if data and not mode then
                             copies[#copies + 1] = { path = target, data = data }
                         end
+                    end
+                    if not rememberDirectoryAttempts(old_dir) then
+                        UIManager:show(InfoMessage:new{ text = _("无法读取原目录的请求记录，请检查目录后重试") })
+                        return
                     end
                     for i, copy in ipairs(copies) do
                         if not writeAtomic(copy.path, copy.data) then
@@ -804,7 +834,6 @@ function Yiyan:chooseOutputDirectory()
                         UIManager:show(InfoMessage:new{ text = _("无法更新新目录的屏保文件") })
                         return
                     end
-                    rememberDirectoryAttempts(old_dir)
                     SAVE_DIR = dir
                     G_reader_settings:saveSetting(SETTING_SAVE_DIR, dir)
                     G_reader_settings:flush()
