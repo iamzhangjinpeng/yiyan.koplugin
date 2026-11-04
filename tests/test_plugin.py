@@ -113,6 +113,8 @@ end
 local http = {}
 function http.request(request)
     f.requests = f.requests + 1
+    f.request_url = request.url
+    assert(request.method == "GET")
     assert(request.redirect == false, "a redirect must not spend another request")
     if f.http_error then return nil, "offline" end
     local ok, err = request.sink(f.raw_response)
@@ -136,7 +138,7 @@ local modules = {
         if not file then return false end
         local data = file:read("*a")
         file:close()
-        if data == test_png then return true, { data = "decoded" } end
+        if data == test_png or data == alternate_test_png then return true, { data = "decoded" } end
         return false, "invalid PNG"
     end },
     ["ui/renderimage"] = {
@@ -166,6 +168,9 @@ local modules = {
     ["gettext"] = function(v) return v end,
     ["libs/libkoreader-lfs"] = {
         attributes = py_mode,
+        symlinkattributes = py_symlink_mode,
+        mkdir = py_mkdir_exclusive,
+        rmdir = py_rmdir,
         dir = function(path)
             local names, i = py_listdir(path), 0
             return function() i = i + 1; return names[i] end
@@ -195,6 +200,9 @@ class PluginTests(unittest.TestCase):
         g.test_png = PNG
         g.py_mkdir = lambda p: Path(p).mkdir(parents=True, exist_ok=True)
         g.py_mode = lambda p, _: "directory" if Path(p).is_dir() else "file" if Path(p).is_file() else None
+        g.py_symlink_mode = lambda p, key: "link" if Path(p).is_symlink() else g.py_mode(p, key)
+        g.py_mkdir_exclusive = self.mkdir_exclusive
+        g.py_rmdir = lambda p: Path(p).rmdir()
         g.py_listdir = lambda p: self.lua.table_from(sorted(x.name for x in Path(p).iterdir()))
         g.py_encode = lambda v: json.dumps(self.to_python(v), ensure_ascii=False)
         g.py_decode = lambda s: self.to_lua(json.loads(s))
@@ -206,6 +214,14 @@ class PluginTests(unittest.TestCase):
 
     def tearDown(self):
         self.tmp.cleanup()
+
+    @staticmethod
+    def mkdir_exclusive(path):
+        try:
+            Path(path).mkdir()
+        except OSError:
+            return False
+        return True
 
     def to_python(self, value):
         if hasattr(value, "items"):
@@ -226,12 +242,54 @@ class PluginTests(unittest.TestCase):
 
     def test_success_is_requested_only_once_even_after_settings_reset(self):
         self.refresh()
+        self.assertEqual(self.f.request_url, "https://v1.hitokoto.cn/?encode=json&charset=utf-8")
         self.assertTrue((self.path / (self.date + ".png")).exists())
         self.assertEqual(json.loads((self.path / (self.date + ".json")).read_text())["layout_version"], 5)
         self.f.settings.data = self.lua.table()
         self.refresh()
         self.assertEqual(self.f.requests, 1)
         self.assertEqual(self.f.live_widgets, 0)
+
+    def test_category_menu_updates_the_next_request_only(self):
+        self.lua.globals().test_time = int(datetime(2026, 11, 4, 8, tzinfo=timezone.utc).timestamp())
+        self.lua.execute("os.time = function() return test_time end")
+        menu = self.lua.table()
+        self.obj.addToMainMenu(self.obj, menu)
+        categories = menu.yiyan.sub_item_table[2].sub_item_table
+        self.assertEqual([categories[i].text for i in range(1, len(categories) + 1)], [
+            "默认随机", "动画", "漫画", "游戏", "文学", "原创", "来自网络", "其他",
+            "影视", "诗词", "网易云", "哲学", "抖机灵",
+        ])
+        self.assertTrue(categories[1].checked_func())
+        categories[11].callback()
+        categories[5].callback()
+        self.assertFalse(categories[1].checked_func())
+        self.assertTrue(categories[11].checked_func())
+        self.assertTrue(categories[5].checked_func())
+        self.f.raw_response = json.dumps({
+            **self.payload, "type": "j", "from_who": None, "uuid": "75a45fd4-4f2f-45eb-80cb-6f0a7bcdfaf2",
+        })
+        self.refresh()
+        self.assertEqual(self.f.request_url, "https://v1.hitokoto.cn/?encode=json&charset=utf-8&c=d&c=j")
+        payload = json.loads((self.path / "20261104.json").read_text())["payload"]
+        self.assertEqual(payload["type"], "j")
+        self.assertEqual(payload["from_who"], "")
+        self.assertEqual(payload["uuid"], "75a45fd4-4f2f-45eb-80cb-6f0a7bcdfaf2")
+
+        categories[5].callback()
+        categories[10].callback()
+        self.refresh()
+        self.assertEqual(self.f.requests, 1)
+        self.lua.execute("test_time = test_time + 86400")
+        self.obj = self.lua.globals().newPlugin()
+        self.refresh()
+        self.assertEqual(self.f.requests, 2)
+        self.assertEqual(self.f.request_url, "https://v1.hitokoto.cn/?encode=json&charset=utf-8&c=i&c=j")
+        categories[1].callback()
+        self.assertTrue(categories[1].checked_func())
+        self.lua.execute("test_time = test_time + 86400")
+        self.refresh()
+        self.assertEqual(self.f.request_url, "https://v1.hitokoto.cn/?encode=json&charset=utf-8")
 
     def test_failed_request_is_not_retried_after_restart(self):
         self.f.http_error = True
@@ -346,6 +404,49 @@ class PluginTests(unittest.TestCase):
         self.refresh()
         self.assertEqual(self.f.requests, 1)
 
+    def test_stop_cancels_worker_across_instances_and_preserves_daily_limit(self):
+        old_archive = self.path / "20000101.png"
+        old_archive.write_bytes(PNG)
+        old_archive.with_suffix(".json").write_text(json.dumps({
+            "date": "20000101", "owner": "yiyan.koplugin", "payload": self.payload,
+            "image_digest": PNG.hex(),
+        }))
+        self.f.hung = True
+        previous = self.obj
+        previous.refreshDaily(previous, True)
+        previous.onCloseWidget(previous)
+        self.obj = self.lua.globals().newPlugin()
+        self.obj.stopPlugin(self.obj)
+        self.f.drain(self.f)
+        self.assertEqual(self.f.kills, 1)
+        self.assertFalse(previous._busy)
+        self.assertFalse((self.path / (self.date + ".json")).exists())
+        self.assertFalse((self.path / (self.date + ".png")).exists())
+        self.assertFalse((self.path / ".yiyan-screen").exists())
+        self.assertTrue(old_archive.exists())
+        self.assertTrue(old_archive.with_suffix(".json").exists())
+        self.assertFalse(list(self.path.glob(".yiyan-work-*")))
+        self.obj = self.lua.globals().newPlugin()
+        self.refresh()
+        self.assertEqual(self.f.requests, 1)
+
+    def test_widget_close_allows_already_started_request_to_finish(self):
+        self.obj.refreshDaily(self.obj, True)
+        self.obj.onCloseWidget(self.obj)
+        self.f.drain(self.f)
+        self.assertTrue((self.path / (self.date + ".png")).exists())
+        self.assertIsNone(self.f.kills)
+
+    def test_stop_discards_a_finished_response_before_it_can_be_published(self):
+        self.obj.refreshDaily(self.obj, True)
+        self.assertTrue(self.f.done)
+        self.obj.stopPlugin(self.obj)
+        self.f.drain(self.f)
+        self.assertIsNone(self.f.kills)
+        self.assertFalse((self.path / (self.date + ".json")).exists())
+        self.assertFalse((self.path / ".yiyan-screen").exists())
+        self.assertFalse(list(self.path.glob(".yiyan-work-*")))
+
     def test_ui_transition_cancels_previous_periodic_callback(self):
         self.f.settings.data["yiyan_auto_screensaver"] = False
         self.obj.init(self.obj)
@@ -426,6 +527,13 @@ class PluginTests(unittest.TestCase):
             io.open = function(path, ...) return open(map(path), ...) end
             os.rename = function(src, dst) return rename(map(src), map(dst)) end
             os.remove = function(path) return remove(map(path)) end
+            local lfs = package.loaded["libs/libkoreader-lfs"]
+            local attributes, symlinkattributes, mkdir, rmdir =
+                lfs.attributes, lfs.symlinkattributes, lfs.mkdir, lfs.rmdir
+            lfs.attributes = function(path, ...) return attributes(map(path), ...) end
+            lfs.symlinkattributes = function(path, ...) return symlinkattributes(map(path), ...) end
+            lfs.mkdir = function(path) return mkdir(map(path)) end
+            lfs.rmdir = function(path) return rmdir(map(path)) end
             package.loaded["util"].makePath = function(path)
                 py_mkdir(map(path))
                 return true
@@ -480,6 +588,78 @@ class PluginTests(unittest.TestCase):
         self.refresh(True, True)
         self.assertEqual(path.read_bytes(), b"user replacement")
         self.assertEqual(self.f.requests, 1)
+
+    def test_refresh_preserves_foreign_temporary_files_and_directories(self):
+        self.lua.globals().test_time = int(datetime(2026, 11, 4, 8, tzinfo=timezone.utc).timestamp())
+        self.lua.execute("os.time = function() return test_time end")
+        display_dir = self.path / ".yiyan-screen"
+        display_dir.mkdir()
+        foreign_stage = self.path / f".yiyan-work-{self.lua.globals().test_time}-1"
+        foreign_stage.mkdir()
+        foreign_files = [
+            self.path / ("20261104" + suffix)
+            for suffix in (".response.tmp", ".response.tmp.tmp", ".attempt.tmp", ".json.tmp", ".png.tmp")
+        ] + [display_dir / "wallpaper.png.tmp", foreign_stage / "data"]
+        for file in foreign_files:
+            file.write_bytes(b"unrelated data")
+        self.refresh()
+        self.assertEqual(self.f.requests, 1)
+        self.assertEqual((display_dir / "wallpaper.png").read_bytes(), PNG)
+        for file in foreign_files:
+            self.assertEqual(file.read_bytes(), b"unrelated data")
+        self.assertEqual(list(self.path.glob(".yiyan-work-*")), [foreign_stage])
+        self.assertFalse(list(display_dir.glob(".yiyan-work-*")))
+
+    def test_render_transaction_recovers_at_each_rename_boundary(self):
+        self.refresh()
+        archive = self.path / (self.date + ".png")
+        cache = archive.with_suffix(".json")
+        display = self.path / ".yiyan-screen/wallpaper.png"
+        old_cache = json.loads(cache.read_text())
+        old_cache["layout_version"] = 4
+        new_png = (ROOT / "docs/demo.png").read_bytes()
+        self.lua.globals().alternate_test_png = new_png
+        self.f.invalid_png = new_png
+        self.lua.execute(r'''
+            local rename = os.rename
+            os.rename = function(src, dst)
+                if dst:match("%d+%.json$") then
+                    f.cache_renames = f.cache_renames + 1
+                    if f.cache_renames == f.fail_cache_rename then return nil, "disk full" end
+                end
+                if f.fail_archive_rename and dst:match("%d+%.png$") then return nil, "disk full" end
+                return rename(src, dst)
+            end
+        ''')
+        for failure in ("pending_cache", "archive", "final_cache"):
+            with self.subTest(failure=failure):
+                archive.write_bytes(PNG)
+                display.write_bytes(PNG)
+                cache.write_text(json.dumps(old_cache))
+                self.f.cache_renames = 0
+                self.f.fail_cache_rename = {"pending_cache": 1, "final_cache": 2}.get(failure)
+                self.f.fail_archive_rename = failure == "archive"
+                self.refresh()
+                self.assertEqual(archive.read_bytes(), new_png if failure == "final_cache" else PNG)
+                self.assertEqual(display.read_bytes(), PNG)
+                interrupted = json.loads(cache.read_text())
+                self.assertEqual(interrupted["image_digest"], PNG.hex())
+                self.assertEqual("pending_image" in interrupted, failure != "pending_cache")
+                self.assertFalse(list(self.path.glob(".yiyan-work-*")))
+
+                self.f.fail_cache_rename, self.f.fail_archive_rename = None, False
+                self.f.connected = False
+                self.obj = self.lua.globals().newPlugin()
+                previous_renders = self.f.renders
+                self.refresh()
+                self.assertEqual(archive.read_bytes(), new_png)
+                self.assertEqual(display.read_bytes(), new_png)
+                recovered = json.loads(cache.read_text())
+                self.assertEqual(recovered["layout_version"], 5)
+                self.assertEqual(recovered["image_digest"], new_png.hex())
+                self.assertNotIn("pending_image", recovered)
+                self.assertEqual(self.f.renders - previous_renders, 0 if failure == "final_cache" else 1)
+                self.assertEqual(self.f.requests, 1)
 
     def test_undecodable_png_with_valid_header_and_tail_is_never_published(self):
         display = self.path / ".yiyan-screen/wallpaper.png"

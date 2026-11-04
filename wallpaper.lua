@@ -118,11 +118,10 @@ local function textInBox(text, box, is_footer)
     end
 end
 
+-- The caller provides a private staging path and publishes the validated PNG.
 function Wallpaper.render(plugin_path, payload, date, target, width, height)
     local image, background, eink
     local widgets = {}
-    local tmp = target .. ".tmp"
-    os.remove(tmp)
     local ok, result = pcall(function()
         local layout = Wallpaper.layout(width, height)
         background = RenderImage:renderImageFile(plugin_path .. "/assets/lyrics-background.png", false)
@@ -151,10 +150,9 @@ function Wallpaper.render(plugin_path, payload, date, target, width, height)
         eink:ditherblitFrom(image, 0, 0, 0, 0, width, height)
         image:free()
         image, eink = eink, nil
-        local called, written, err = image:writeToFile(tmp, "png")
+        local called, written, err = image:writeToFile(target, "png")
         assert(called and written ~= false, err or written or "Cannot write the wallpaper PNG")
-        assert(Wallpaper.isValidPNG(tmp), "Incomplete wallpaper PNG")
-        assert(os.rename(tmp, target), "Cannot replace the wallpaper PNG")
+        assert(Wallpaper.isValidPNG(target), "Incomplete wallpaper PNG")
         return true
     end)
     for _, widget in ipairs(widgets) do widget:free() end
@@ -162,7 +160,6 @@ function Wallpaper.render(plugin_path, payload, date, target, width, height)
     if eink then eink:free() end
     if image then image:free() end
     if not ok then
-        os.remove(tmp)
         logger.warn("Yiyan: wallpaper rendering failed", tostring(result))
         return false, tostring(result)
     end

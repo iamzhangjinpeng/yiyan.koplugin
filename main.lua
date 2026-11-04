@@ -33,23 +33,23 @@ local SETTING_AUTO = "yiyan_auto_screensaver"
 local SETTING_BACKUP = "yiyan_screensaver_backup"
 local SETTING_LAST_ATTEMPT = "yiyan_last_attempt_date"
 local SETTING_SAVE_DIR = "yiyan_save_dir"
+local SETTING_CATEGORIES = "yiyan_categories"
 local CACHE_OWNER = "yiyan.koplugin"
+local CATEGORIES = {
+    { "a", _("动画") }, { "b", _("漫画") }, { "c", _("游戏") },
+    { "d", _("文学") }, { "e", _("原创") }, { "f", _("来自网络") },
+    { "g", _("其他") }, { "h", _("影视") }, { "i", _("诗词") },
+    { "j", _("网易云") }, { "k", _("哲学") }, { "l", _("抖机灵") },
+}
 
 local active_worker
 local active_instance
+local staging_id = 0
 local function workerNow() return time.to_s(time.boottime_or_monotonic()) end
 local function todayDate()
     local t = os.date("!*t", os.time() + UTC_OFFSET)
     local date = string.format("%04d%02d%02d", t.year, t.month, t.day)
     return date
-end
-
-local function fileExists(path)
-    local f = io.open(path, "rb")
-    if not f then return false end
-    local size = f:seek("end")
-    f:close()
-    return size and size > 0
 end
 
 local function readFile(path)
@@ -60,17 +60,38 @@ local function readFile(path)
     return data
 end
 
-local function writeAtomic(path, data)
-    local tmp = path .. ".tmp"
-    local f = io.open(tmp, "wb")
+local function stageFile(path)
+    local parent = path:match("^(.*)/[^/]+$")
+    -- Reserve a directory on the same filesystem. mkdir is exclusive, so even
+    -- preexisting staging names and files from other applications are untouched.
+    local prefix = parent .. "/.yiyan-work-" .. os.time() .. "-"
+    for _ = 1, 32 do
+        staging_id = staging_id + 1
+        local dir = prefix .. staging_id
+        if lfs.mkdir(dir) then return dir .. "/data", dir end
+        if not lfs.symlinkattributes(dir, "mode") then return nil end
+    end
+end
+
+local function discardStage(path, dir)
+    os.remove(path)
+    lfs.rmdir(dir)
+end
+
+local function writeFile(path, data)
+    local f = io.open(path, "wb")
     if not f then return false end
     local written = f:write(data)
     local closed = f:close()
-    if not written or not closed or not os.rename(tmp, path) then
-        os.remove(tmp)
-        return false
-    end
-    return true
+    return written and closed
+end
+
+local function writeAtomic(path, data)
+    local tmp, dir = stageFile(path)
+    if not tmp then return false end
+    local written = writeFile(tmp, data) and os.rename(tmp, path)
+    discardStage(tmp, dir)
+    return written
 end
 
 local function validPayload(payload)
@@ -92,6 +113,28 @@ end
 local function saveCache(dir, cached)
     local ok, raw = pcall(json.encode, cached)
     return ok and type(raw) == "string" and writeAtomic(dir .. cached.date .. ".json", raw)
+end
+
+local function readCategories()
+    local saved = G_reader_settings:readSetting(SETTING_CATEGORIES)
+    local selected = {}
+    if type(saved) == "table" then
+        for _, category in ipairs(CATEGORIES) do
+            local code = category[1]
+            if saved[code] == true then selected[code] = true end
+        end
+    end
+    return selected
+end
+
+local function requestURL()
+    local selected = readCategories()
+    local query = { "encode=json", "charset=utf-8" }
+    for _, category in ipairs(CATEGORIES) do
+        local code = category[1]
+        if selected[code] then query[#query + 1] = "c=" .. code end
+    end
+    return "https://v1.hitokoto.cn/?" .. table.concat(query, "&")
 end
 
 local function networkIsConnected()
@@ -246,6 +289,7 @@ end
 
 function Yiyan:stopPlugin()
     self:onCloseWidget()
+    if active_worker then active_worker.cancel() end
     restoreScreensaver(false)
 end
 
@@ -254,8 +298,12 @@ function Yiyan:requestSentence(dir, date, callback)
         callback(nil, "busy")
         return
     end
-    local response_path = dir .. date .. ".response.tmp"
-    os.remove(response_path)
+    local response_path, work_dir = stageFile(dir .. date .. ".response")
+    if not response_path then
+        callback(nil, "write_error")
+        return
+    end
+    local url = requestURL()
     local pid, read_fd
     local started, start_err = pcall(function()
         pid, read_fd = ffiutil.runInSubProcess(function(_, child_write_fd)
@@ -269,9 +317,9 @@ function Yiyan:requestSentence(dir, date, callback)
                     return
                 end
                 local request_ok, code = http.request{
-                    url = "https://v1.hitokoto.cn/?encode=json",
+                    url = url,
                     method = "GET",
-                    headers = { ["User-Agent"] = "KOReader-yiyan.koplugin/1.2.1" },
+                    headers = { ["User-Agent"] = "KOReader-yiyan.koplugin/1.2.2" },
                     redirect = false,
                     sink = function(chunk, sink_err)
                         if sink_err then return nil, sink_err end
@@ -291,7 +339,7 @@ function Yiyan:requestSentence(dir, date, callback)
                     -- Only send a small status through the pipe. The parent
                     -- waits for exit before reading it; a full JSON pipe could
                     -- otherwise block the child before it can exit.
-                    result = writeAtomic(response_path, table.concat(chunks)) and "ok" or "write_error"
+                    result = writeFile(response_path, table.concat(chunks)) and "ok" or "ERR\nwrite_error"
                 end
             end)
             if not ok then result = "ERR\nnetwork_error" end
@@ -299,21 +347,21 @@ function Yiyan:requestSentence(dir, date, callback)
         end, true)
     end)
     if not started or not pid then
+        discardStage(response_path, work_dir)
         logger.warn("Yiyan: cannot start request worker", tostring(start_err or read_fd))
         callback(nil, "network_error")
         return
     end
 
-    active_worker = { pid = pid, read_fd = read_fd, callback = callback,
-        deadline = workerNow() + HTTP_TIMEOUT, timed_out = false }
+    local worker = { deadline = workerNow() + HTTP_TIMEOUT }
+    active_worker = worker
     UIManager:preventStandby()
 
     local function poll()
-        local worker = active_worker
-        if not worker or worker.pid ~= pid then return end
+        if active_worker ~= worker then return end
         if not ffiutil.isSubProcessDone(pid) then
-            if workerNow() >= worker.deadline or worker.timed_out then
-                worker.timed_out = true
+            worker.timed_out = worker.timed_out or workerNow() >= worker.deadline
+            if worker.cancelled or worker.timed_out then
                 -- A kill can race the child's initial process-group setup.
                 -- Retry until waitpid confirms the old writer has exited.
                 ffiutil.terminateSubProcess(pid)
@@ -324,24 +372,32 @@ function Yiyan:requestSentence(dir, date, callback)
 
         active_worker = nil
         UIManager:allowStandby()
-        local read_ok, response = pcall(ffiutil.readAllFromFD, worker.read_fd)
-        local raw = readFile(response_path)
-        os.remove(response_path)
-        os.remove(response_path .. ".tmp")
+        local read_ok, response = pcall(ffiutil.readAllFromFD, read_fd)
+        local raw = not worker.cancelled and not worker.timed_out and response == "ok" and readFile(response_path)
+        discardStage(response_path, work_dir)
+        if worker.cancelled then
+            self._busy = false
+            return
+        end
         if worker.timed_out then
-            worker.callback(nil, "timeout")
+            callback(nil, "timeout")
         elseif not read_ok or type(response) ~= "string" then
-            worker.callback(nil, "network_error")
+            callback(nil, "network_error")
         elseif response == "ok" and raw then
             local decoded_ok, payload = pcall(json.decode, raw)
             if decoded_ok and validPayload(payload) then
-                worker.callback(payload)
+                callback(payload)
             else
-                worker.callback(nil, "invalid_response")
+                callback(nil, "invalid_response")
             end
         else
-            worker.callback(nil, response:match("^ERR\n(.*)") or "network_error")
+            callback(nil, response:match("^ERR\n(.*)") or "network_error")
         end
+    end
+    worker.cancel = function()
+        worker.cancelled = true
+        UIManager:unschedule(poll)
+        poll()
     end
     UIManager:scheduleIn(POLL_INTERVAL, poll)
 end
@@ -353,37 +409,61 @@ function Yiyan:renderImage(payload, date, target)
 end
 
 function Yiyan:_renderCache(dir, cached, image_path, show_message)
-    if lfs.attributes(image_path, "mode") then
-        local current = cached.image_digest and readFile(image_path)
+    local function notify(message)
+        if show_message and not self._stopped then UIManager:show(InfoMessage:new{ text = message }) end
+    end
+
+    local mode = lfs.symlinkattributes(image_path, "mode")
+    local current = mode == "file" and readFile(image_path)
+    local digest = current and md5(current)
+    local pending = cached.pending_image
+    local recovered = digest and type(pending) == "table" and digest == pending.digest
+        and type(pending.layout_version) == "number" and Wallpaper.isValidPNG(image_path)
+    if not recovered then
         local legacy = not cached.owner and (cached.layout_version == 1 or cached.layout_version == 2)
-        if not legacy and (not current or md5(current) ~= cached.image_digest) then
-            if show_message and not self._stopped then
-                UIManager:show(InfoMessage:new{ text = _("同名图片无法确认归属，请移走后再重新生成") })
-            end
+        if mode and (not digest or (digest ~= cached.image_digest and not legacy)) then
+            notify(_("同名图片无法确认归属，请移走后再重新生成"))
+            return false
+        end
+        local tmp, work_dir = stageFile(image_path)
+        if not tmp then
+            notify(_("无法创建图片临时文件，请检查存储空间和目录权限"))
+            return false
+        end
+        local rendered = self:renderImage(cached.payload, cached.date, tmp) and readFile(tmp)
+        if not rendered then
+            discardStage(tmp, work_dir)
+            notify(_("图片生成失败，句子已缓存，可稍后离线重新生成"))
+            return false
+        end
+
+        -- Record both digests before replacing the archive. After an interrupted
+        -- update, either the previous image or the staged one can be identified.
+        pending = { digest = md5(rendered), layout_version = Wallpaper.VERSION }
+        cached.pending_image = pending
+        local replaced = saveCache(dir, cached) and os.rename(tmp, image_path)
+        discardStage(tmp, work_dir)
+        if not replaced then
+            notify(_("图片更新未完成，可稍后离线重新生成"))
             return false
         end
     end
-    local ok = self:renderImage(cached.payload, cached.date, image_path)
-    if not ok then
-        if show_message and not self._stopped then
-            UIManager:show(InfoMessage:new{ text = _("图片生成失败，句子已缓存，可稍后离线重新生成") })
-        end
+
+    cached.layout_version = pending.layout_version
+    cached.owner = CACHE_OWNER
+    cached.image_digest = pending.digest
+    cached.pending_image = nil
+    if not saveCache(dir, cached) then
+        notify(_("图片已生成，但缓存保存失败，可稍后离线恢复"))
         return false
     end
-    cached.layout_version = Wallpaper.VERSION
-    cached.owner = CACHE_OWNER
-    local image = readFile(image_path)
-    cached.image_digest = image and md5(image)
-    local recorded = saveCache(dir, cached)
+
     local published = publishWallpaper(dir, image_path)
-    if published and recorded then self:cleanupOldImages(dir, cached.date) end
+    if published then self:cleanupOldImages(dir, cached.date) end
     if published and not self._stopped and autoScreensaverEnabled() then
         configureScreensaver(dir)
     end
-    if show_message and not self._stopped then
-        local message = published and _("今日一言壁纸已生成") or _("图片已生成，但未能更新屏保文件")
-        UIManager:show(InfoMessage:new{ text = message })
-    end
+    notify(published and _("今日一言壁纸已生成") or _("图片已生成，但未能更新屏保文件"))
     return published
 end
 
@@ -395,9 +475,12 @@ function Yiyan:cleanupOldImages(dir, keep_date)
             local cached = loadCache(dir, date)
             if cached and cached.owner == CACHE_OWNER then
                 local path = dir .. date .. ".png"
-                local image = cached.image_digest and readFile(path)
+                local image = lfs.symlinkattributes(path, "mode") == "file" and readFile(path)
                 -- Leave legacy images and files replaced by the user alone.
-                local owns_image = image and md5(image) == cached.image_digest
+                local digest = image and md5(image)
+                local pending = cached.pending_image
+                local owns_image = digest and (digest == cached.image_digest
+                    or (type(pending) == "table" and digest == pending.digest))
                 if not owns_image or os.remove(path) then os.remove(dir .. name) end
             end
         end
@@ -422,7 +505,7 @@ function Yiyan:refreshDaily(show_message, force_render, cache_only)
     end
     local valid_image = Wallpaper.isValidPNG(image_path)
     if valid_image and not force_render
-        and (not cached or cached.layout_version == Wallpaper.VERSION) then
+        and (not cached or (not cached.pending_image and cached.layout_version == Wallpaper.VERSION)) then
         local published = publishWallpaper(dir, image_path)
         if published and autoScreensaverEnabled() then configureScreensaver(dir) end
         notify(published and _("今日一言壁纸已存在") or _("图片已生成，但未能更新屏保文件"))
@@ -441,7 +524,7 @@ function Yiyan:refreshDaily(show_message, force_render, cache_only)
         return
     end
     if G_reader_settings:readSetting(SETTING_LAST_ATTEMPT) == date
-        or fileExists(dir .. date .. ".attempt") then
+        or lfs.symlinkattributes(dir .. date .. ".attempt", "mode") then
         notify(_("今天已请求过一言，明天再试"))
         return
     end
@@ -477,6 +560,7 @@ function Yiyan:refreshDaily(show_message, force_render, cache_only)
         local record = { date = date, owner = CACHE_OWNER, payload = { hitokoto = payload.hitokoto,
             from = type(payload.from) == "string" and payload.from or "",
             from_who = type(payload.from_who) == "string" and payload.from_who or "",
+            type = type(payload.type) == "string" and payload.type or nil,
             uuid = type(payload.uuid) == "string" and payload.uuid or nil } }
         if not saveCache(dir, record) then
             notify(_("句子已返回，但缓存保存失败；请检查存储空间"))
@@ -564,6 +648,27 @@ function Yiyan:chooseOutputDirectory()
 end
 
 function Yiyan:addToMainMenu(menu_items)
+    local categories = {{
+        text = _("默认随机"),
+        checked_func = function() return next(readCategories()) == nil end,
+        callback = function()
+            G_reader_settings:delSetting(SETTING_CATEGORIES)
+            G_reader_settings:flush()
+        end,
+    }}
+    for _, category in ipairs(CATEGORIES) do
+        local code, label = category[1], category[2]
+        categories[#categories + 1] = {
+            text = label,
+            checked_func = function() return readCategories()[code] == true end,
+            callback = function()
+                local selected = readCategories()
+                selected[code] = not selected[code] or nil
+                G_reader_settings:saveSetting(SETTING_CATEGORIES, selected)
+                G_reader_settings:flush()
+            end,
+        }
+    end
     menu_items.yiyan = {
         text = _("一言壁纸"),
         sorting_hint = "tools",
@@ -586,6 +691,7 @@ function Yiyan:addToMainMenu(menu_items)
                     end
                 end,
             },
+            { text = _("句子类型（下次请求生效）"), sub_item_table = categories },
             { text = _("生成今日壁纸"), callback = function() self:refreshDaily(true) end },
             { text = _("重新生成今日图片（不联网）"), callback = function() self:refreshDaily(true, true, true) end },
             { text = _("设置屏保图片目录"), callback = function() self:chooseOutputDirectory() end },
