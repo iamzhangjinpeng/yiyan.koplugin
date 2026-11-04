@@ -47,6 +47,7 @@ local CATEGORIES = {
 
 local active_worker
 local active_instance
+local last_request
 local staging_id = 0
 local function workerNow() return time.to_s(time.boottime_or_monotonic()) end
 local function todayDate(now)
@@ -259,6 +260,41 @@ local function networkIsConnected()
         if ok then return connected == true end
     end
     return false
+end
+
+local function connectionStatus(connected)
+    if connected then return _("已连接本地网络") end
+    if NetworkMgr and NetworkMgr.isWifiOn then
+        local ok, on = pcall(NetworkMgr.isWifiOn, NetworkMgr)
+        if ok and on == true then return _("已开启，尚未连通") end
+        if ok and on == false then return _("已关闭") end
+    end
+    return _("未检测到连接")
+end
+
+local function retryWindow(marker, history_status, now)
+    local rate_limit = G_reader_settings:readSetting(SETTING_RATE_LIMIT)
+    local limited = type(rate_limit) == "number" and now < rate_limit
+    local saved_retry = type(history_status) == "number" and history_status or 0
+    local deadline = math.max(marker and marker.retry_at or 0, saved_retry, limited and rate_limit or 0)
+    return deadline, limited
+end
+
+local function requestResultText(status)
+    local messages = {
+        success = _("成功收到句子"),
+        network_error = _("网络请求失败"),
+        timeout = _("请求超时"),
+        invalid_response = _("接口未返回有效句子"),
+        not_started = _("后台任务未能启动"),
+        stale_date = _("临近北京时间零点，已推迟"),
+        received_unstored = _("收到句子，但无法保存"),
+        cancelled = _("请求已取消"),
+        cancelled_success = _("请求已取消，收到的句子未保留"),
+        http_429 = _("服务限流（HTTP 429）"),
+    }
+    local code = status:match("^http_(%d%d%d)$")
+    return messages[status] or (code and _("接口返回 HTTP %s"):format(code)) or _("请求失败")
 end
 
 local function autoScreensaverEnabled()
@@ -482,7 +518,7 @@ function Yiyan:requestSentence(date, response_path, work_dir, callback)
             local request_ok, code = http.request{
                 url = url,
                 method = "GET",
-                headers = { ["User-Agent"] = "KOReader-yiyan.koplugin/1.2.6" },
+                headers = { ["User-Agent"] = "KOReader-yiyan.koplugin/1.2.7" },
                 redirect = false,
                 sink = function(chunk, sink_err)
                     if sink_err then return nil, sink_err end
@@ -753,13 +789,12 @@ function Yiyan:refreshDaily(show_message, force_render, cache_only)
         return
     end
     local now = os.time()
-    local rate_limited_until = G_reader_settings:readSetting(SETTING_RATE_LIMIT)
-    if type(rate_limited_until) == "number" and now < rate_limited_until then
+    local deadline, limited = retryWindow(marker, history[date], now)
+    if limited then
         notify(_("一言服务暂时限流，稍后会自动重试"))
         return
     end
-    local saved_retry = type(history[date]) == "number" and history[date] or 0
-    if now < math.max(marker and marker.retry_at or 0, saved_retry) then
+    if now < deadline then
         notify(_("上次请求未完成，稍后会自动重试"))
         return
     end
@@ -784,6 +819,7 @@ function Yiyan:refreshDaily(show_message, force_render, cache_only)
     self._busy = true
     self:requestSentence(date, response_path, work_dir, function(received, err)
         self._busy = false
+        last_request = { date = date, status = received and "success" or err or "network_error" }
         if err == "cancelled" then
             -- Revoke the response pointer before KOReader can exit and drop
             -- the poll callback. Preserve a known success without publishing it.
@@ -825,6 +861,72 @@ function Yiyan:refreshDaily(show_message, force_render, cache_only)
             notify(_("已收到今日句子，但暂时无法读取缓存"))
         end
     end)
+end
+
+function Yiyan:networkDiagnostics()
+    local now = os.time()
+    local date = todayDate(now)
+    local dir = SAVE_DIR
+    local connected = networkIsConnected()
+    local marker, marker_mode = readAttempt(dir, date)
+    local history_status = attemptHistory()[date]
+    local cached, cache_conflict = loadCache(dir, date)
+    local staged = not cached and loadStagedCache(dir, date)
+    local image_path = dir .. date .. ".png"
+    local image_exists = lfs.symlinkattributes(image_path, "mode") ~= nil
+    local valid_image = image_exists and Wallpaper.isValidPNG(image_path)
+    local usable_image = valid_image and not cache_conflict and matchesArchivedImage(image_path, cached)
+    local legacy_image = usable_image and not cached and not staged
+
+    local sentence = _("尚未获取")
+    if cached then
+        sentence = _("已缓存")
+    elseif staged then
+        sentence = (cache_conflict or image_exists) and _("已收到，等待处理同名文件")
+            or _("已收到，等待保存到缓存")
+    elseif (marker and marker.success) or wasSuccessful(history_status) then
+        sentence = _("已获取，缓存不可用")
+    elseif legacy_image then
+        sentence = _("旧版壁纸无句子缓存")
+    end
+
+    local wallpaper = _("尚未生成")
+    if cached and cached.pending_image then
+        wallpaper = _("等待完成更新")
+    elseif usable_image then
+        wallpaper = (cached and cached.layout_version ~= Wallpaper.VERSION) and _("等待重新生成")
+            or _("已就绪")
+    elseif image_exists then
+        wallpaper = _("文件无法使用")
+    end
+
+    local deadline, limited = retryWindow(marker, history_status, now)
+    local request
+    if self._busy or active_worker then
+        request = _("后台请求进行中")
+    elseif cached or staged or (marker and marker.success) or wasSuccessful(history_status) or legacy_image then
+        request = _("今日无需再请求")
+    elseif cache_conflict or image_exists or (marker_mode and not marker) then
+        request = _("同名文件冲突")
+    elseif now < deadline then
+        local wait = _("%d 分钟后可重试"):format(math.ceil((deadline - now) / 60))
+        request = (limited and _("服务限流") or _("等待重试")) .. "（" .. wait .. "）"
+    elseif not connected then
+        request = _("等待联网")
+    else
+        request = _("等待下次检查")
+    end
+
+    local lines = {
+        _("Wi-Fi") .. "  " .. connectionStatus(connected),
+        _("今日句子") .. "  " .. sentence,
+        _("今日壁纸") .. "  " .. wallpaper,
+        _("请求状态") .. "  " .. request,
+    }
+    if last_request and last_request.date == date then
+        lines[#lines + 1] = _("最近请求") .. "  " .. requestResultText(last_request.status)
+    end
+    return table.concat(lines, "\n")
 end
 
 function Yiyan:chooseOutputDirectory()
@@ -1000,6 +1102,9 @@ function Yiyan:addToMainMenu(menu_items)
             { text = _("句子类型（下次请求生效）"), sub_item_table = categories },
             { text = _("生成今日壁纸"), callback = function() self:refreshDaily(true) end },
             { text = _("重新生成今日图片（不联网）"), callback = function() self:refreshDaily(true, true, true) end },
+            { text = _("网络诊断"), callback = function()
+                UIManager:show(InfoMessage:new{ text = self:networkDiagnostics() })
+            end },
             { text = _("设置屏保图片目录"), callback = function() self:chooseOutputDirectory() end },
         },
     }

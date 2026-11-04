@@ -166,7 +166,10 @@ local modules = {
     ["ffi/util"] = ffi,
     ["socket.http"] = http,
     ["socketutil"] = { set_timeout = function() end },
-    ["ui/network/manager"] = { isConnected = function() return f.connected end },
+    ["ui/network/manager"] = {
+        isConnected = function() return f.connected end,
+        isWifiOn = function() return f.wifi_on end,
+    },
     ["ui/time"] = { to_s = function(v) return v end, boottime_or_monotonic = function() return f.now end },
     ["logger"] = { warn = function() end },
     ["json"] = { encode = py_encode, decode = py_decode },
@@ -262,6 +265,48 @@ class PluginTests(unittest.TestCase):
         self.refresh()
         self.assertEqual(self.f.requests, 1)
         self.assertEqual(self.f.live_widgets, 0)
+
+    def test_diagnostics_menu_checks_wifi_without_sending_or_scheduling_requests(self):
+        menu = self.lua.table()
+        self.obj.addToMainMenu(self.obj, menu)
+        diagnostics = next(item.callback for _, item in menu.yiyan.sub_item_table.items()
+                           if item.text == "网络诊断")
+        self.f.connected, self.f.wifi_on = False, False
+        diagnostics()
+        self.assertIn("Wi-Fi  已关闭", self.f.message)
+        self.assertIn("等待联网", self.f.message)
+        self.f.wifi_on = True
+        diagnostics()
+        self.assertIn("已开启，尚未连通", self.f.message)
+        self.f.connected = True
+        diagnostics()
+        self.assertIn("已连接本地网络", self.f.message)
+        self.assertIn("等待下次检查", self.f.message)
+        self.assertEqual(self.f.requests, 0)
+        self.assertEqual(len(self.f.queue), 0)
+        self.assertFalse(list(self.path.iterdir()))
+
+    def test_diagnostics_reports_request_progress_cooldown_and_success(self):
+        self.f.http_code = 429
+        self.obj.refreshDaily(self.obj, False)
+        self.assertIn("后台请求进行中", self.obj.networkDiagnostics(self.obj))
+        self.f.drain(self.f)
+        failed = self.obj.networkDiagnostics(self.obj)
+        self.assertIn("服务限流（60 分钟后可重试）", failed)
+        self.assertIn("最近请求  服务限流（HTTP 429）", failed)
+        self.assertEqual(self.f.requests, 1)
+        self.lua.execute("plugin = loadPlugin(); obj = newPlugin()")
+        self.obj = self.lua.globals().obj
+        self.assertIn("服务限流（60 分钟后可重试）", self.obj.networkDiagnostics(self.obj))
+        self.lua.execute("test_clock = test_clock + 3600")
+        self.f.http_code = 200
+        self.refresh()
+        complete = self.obj.networkDiagnostics(self.obj)
+        self.assertIn("今日句子  已缓存", complete)
+        self.assertIn("今日壁纸  已就绪", complete)
+        self.assertIn("今日无需再请求", complete)
+        self.assertIn("最近请求  成功收到句子", complete)
+        self.assertEqual(self.f.requests, 2)
 
     def test_category_menu_updates_the_next_request_only(self):
         self.lua.globals().test_time = int(datetime(2026, 11, 4, 8, tzinfo=timezone.utc).timestamp())
