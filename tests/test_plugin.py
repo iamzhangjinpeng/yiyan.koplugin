@@ -304,13 +304,56 @@ class PluginTests(unittest.TestCase):
         self.refresh()
         self.assertEqual(self.f.request_url, "https://v1.hitokoto.cn/?encode=json&charset=utf-8")
 
-    def test_failed_request_is_not_retried_after_restart(self):
+    def test_failed_request_can_succeed_later_same_day_after_restart(self):
         self.f.http_error = True
         self.refresh()
         self.f.settings.data = self.lua.table()
-        self.obj = self.lua.globals().newPlugin()
+        self.lua.execute("plugin = loadPlugin(); obj = newPlugin()")
+        self.obj = self.lua.globals().obj
+        self.f.http_error = False
         self.refresh()
         self.assertEqual(self.f.requests, 1)
+        self.lua.execute("test_clock = test_clock + 300")
+        self.refresh()
+        self.lua.execute("test_clock = test_clock + 300")
+        self.refresh()
+        self.assertEqual(self.f.requests, 2)
+        self.assertTrue((self.path / (self.date + ".png")).exists())
+
+    def test_legacy_failed_request_record_does_not_block_today(self):
+        settings = self.f.settings.data
+        settings.yiyan_last_attempt_date = self.date
+        settings.yiyan_attempt_history = self.lua.table_from({self.date: True})
+        (self.path / (self.date + ".attempt")).write_text(self.date + "\n.yiyan-work-123-1\n")
+        self.refresh()
+        self.assertEqual(self.f.requests, 1)
+        self.assertTrue((self.path / (self.date + ".png")).exists())
+
+    def test_rate_limiting_waits_an_hour_even_after_directory_change(self):
+        self.f.http_code = 429
+        self.refresh()
+        self.assertIn("一小时", self.f.message)
+        self.open_output_directory_dialog()
+        self.lua.execute("pending_save(); test_clock = test_clock + 3599")
+        self.f.http_code = 200
+        self.refresh()
+        self.assertEqual(self.f.requests, 1)
+        self.lua.execute("test_clock = test_clock + 1")
+        self.refresh()
+        self.assertEqual(self.f.requests, 2)
+
+    def test_rate_limiting_survives_beijing_midnight(self):
+        self.lua.globals().test_clock = int(datetime(2026, 11, 4, 15, 55, tzinfo=timezone.utc).timestamp())
+        self.f.http_code = 429
+        self.refresh()
+        self.f.http_code = 200
+        self.lua.execute("test_clock = test_clock + 600")
+        self.refresh()
+        self.assertEqual(self.f.requests, 1)
+        self.lua.execute("test_clock = test_clock + 3000")
+        self.refresh()
+        self.assertEqual(self.f.requests, 2)
+        self.assertTrue((self.path / "20261105.png").exists())
 
     def test_worker_start_failure_releases_unspent_attempt(self):
         settings = self.f.settings.data
@@ -338,6 +381,36 @@ class PluginTests(unittest.TestCase):
         self.f.spawn_hook_error = self.f.http_error = False
         self.refresh()
         self.assertEqual(self.f.requests, 1)
+
+    def test_valid_response_with_storage_failure_does_not_refetch(self):
+        self.lua.execute(r'''
+            local open = io.open
+            io.open = function(path, mode)
+                if path:match("/data%.partial$") and mode == "wb" then return nil, "disk full" end
+                return open(path, mode)
+            end
+        ''')
+        self.refresh()
+        self.assertIn("无法保存", self.f.message)
+        self.assertFalse((self.path / (self.date + ".json")).exists())
+        self.lua.execute("test_clock = test_clock + 3600")
+        self.refresh()
+        self.assertEqual(self.f.requests, 1)
+
+    def test_complete_partial_response_can_be_promoted_without_refetch(self):
+        self.lua.execute(r'''
+            local rename = os.rename
+            os.rename = function(src, dst)
+                if src:match("/data%.partial$") and dst:match("/data$") then
+                    return nil, "worker rename failed"
+                end
+                return rename(src, dst)
+            end
+        ''')
+        self.refresh()
+        self.assertEqual(self.f.requests, 1)
+        self.assertTrue((self.path / (self.date + ".png")).exists())
+        self.assertFalse(list(self.path.glob(".yiyan-work-*")))
 
     def test_received_sentence_survives_failed_cache_promotion_and_restart(self):
         self.lua.execute(r'''
@@ -367,14 +440,19 @@ class PluginTests(unittest.TestCase):
         self.assertTrue(cache_path.with_suffix(".png").exists())
         self.assertFalse(list(self.path.glob(".yiyan-work-*")))
 
-    def test_offline_check_does_not_consume_daily_attempt(self):
+    def test_connecting_at_startup_requests_only_after_connection(self):
         self.f.connected = False
-        self.refresh()
+        self.obj.init(self.obj)
+        self.lua.execute("table.remove(f.queue, 1)()")
         self.assertEqual(self.f.requests, 0)
         self.assertFalse((self.path / (self.date + ".attempt")).exists())
         self.f.connected = True
-        self.refresh()
+        self.obj.onNetworkConnected(self.obj)
+        self.lua.execute("table.remove(f.queue, 1)(); table.remove(f.queue, 1)()")
         self.assertEqual(self.f.requests, 1)
+        self.assertTrue((self.path / (self.date + ".png")).exists())
+        self.obj.onCloseWidget(self.obj)
+        self.f.drain(self.f)
 
     def test_failed_render_can_be_rebuilt_offline_without_refetch(self):
         self.f.fail_render = True
@@ -467,21 +545,31 @@ class PluginTests(unittest.TestCase):
         self.assertEqual(self.f.pipe, "ok")
         self.assertEqual(self.f.requests, 1)
 
-    def test_excessive_response_is_rejected_without_retry(self):
+    def test_excessive_response_is_rejected_and_respects_cooldown(self):
         self.f.raw_response = "x" * 70000
         self.refresh()
         self.refresh()
         self.assertEqual(self.f.requests, 1)
         self.assertFalse((self.path / (self.date + ".png")).exists())
+        self.f.raw_response = json.dumps(self.payload)
+        self.lua.execute("test_clock = test_clock + 300")
+        self.refresh()
+        self.assertEqual(self.f.requests, 2)
+        self.assertTrue((self.path / (self.date + ".png")).exists())
 
     def test_worker_timeout_is_reaped_and_releases_standby_lock(self):
         self.f.hung = True
+        self.f.http_error = True
         self.obj.refreshDaily(self.obj, True)
         self.f.now = 25
         self.f.drain(self.f)
         self.assertEqual(self.f.kills, 1)
         self.refresh()
         self.assertEqual(self.f.requests, 1)
+        self.f.hung = self.f.http_error = False
+        self.lua.execute("test_clock = test_clock + 300")
+        self.refresh()
+        self.assertEqual(self.f.requests, 2)
 
     def test_stop_cancels_worker_across_instances_and_preserves_daily_limit(self):
         old_archive = self.path / "20000101.png"
@@ -506,6 +594,7 @@ class PluginTests(unittest.TestCase):
         self.assertTrue(old_archive.with_suffix(".json").exists())
         self.assertFalse(list(self.path.glob(".yiyan-work-*")))
         self.obj = self.lua.globals().newPlugin()
+        self.lua.execute("test_clock = test_clock + 3600")
         self.refresh()
         self.assertEqual(self.f.requests, 1)
 
@@ -534,7 +623,7 @@ class PluginTests(unittest.TestCase):
         self.assertEqual(self.f.kills, 1)
         self.assertEqual(len(self.f.queue), 1)
         marker = self.path / (self.date + ".attempt")
-        self.assertEqual(marker.read_text(), self.date + "\n")
+        self.assertEqual(marker.read_text(), self.date + "\nsuccess\n")
 
         self.lua.execute("f.queue = {}; f.locks = 0; plugin = loadPlugin(); obj = newPlugin()")
         self.obj = self.lua.globals().obj
@@ -548,15 +637,15 @@ class PluginTests(unittest.TestCase):
         self.obj.refreshDaily(self.obj, True)
         marker = self.path / (self.date + ".attempt")
         self.lua.execute(r'''
-            local open = io.open
-            io.open = function(path, mode)
-                if path:match("%.attempt$") and mode == "wb" then return nil, "unwritable" end
-                return open(path, mode)
+            local rename = os.rename
+            os.rename = function(src, dst)
+                if dst:match("%.attempt$") then return nil, "unwritable" end
+                return rename(src, dst)
             end
         ''')
         self.obj.stopPlugin(self.obj)
         self.assertIn(".yiyan-work-", marker.read_text())
-        self.assertEqual(self.f.settings.data.yiyan_attempt_history[self.date], "cancelled")
+        self.assertEqual(self.f.settings.data.yiyan_attempt_history[self.date], "cancelled_success")
         self.lua.execute("f.queue = {}; f.locks = 0; plugin = loadPlugin(); obj = newPlugin()")
         self.obj = self.lua.globals().obj
         self.refresh()
@@ -796,7 +885,7 @@ class PluginTests(unittest.TestCase):
         settings = self.f.settings.data
         self.assertTrue(settings.yiyan_attempt_history["20261104"])
         self.assertTrue(settings.yiyan_attempt_history["20261105"])
-        # Simulate an upgrade with only the legacy markers and last-attempt setting.
+        # The success markers independently survive resetting the settings.
         settings.yiyan_attempt_history = None
         self.open_output_directory_dialog()
         self.lua.execute("pending_save()")
@@ -807,7 +896,7 @@ class PluginTests(unittest.TestCase):
         self.lua.execute("test_clock = test_clock - 86400")
         self.refresh()
         self.assertEqual(self.f.requests, 2)
-        self.assertIn("今天已请求过", self.f.message)
+        self.assertIn("今日已成功获取", self.f.message)
 
     def test_directory_migration_preserves_a_sentence_awaiting_cache_promotion(self):
         new_path = self.open_output_directory_dialog()
@@ -824,11 +913,28 @@ class PluginTests(unittest.TestCase):
         self.assertFalse((self.path / (self.date + ".json")).exists())
         self.lua.execute("pending_save()")
         self.assertEqual(self.f.settings.data["yiyan_save_dir"], "/mnt/us/test/")
-        self.assertEqual((new_path / (self.date + ".attempt")).read_text(), self.date + "\n")
+        self.assertEqual((new_path / (self.date + ".attempt")).read_text(), self.date + "\nsuccess\n")
         self.f.connected = False
         self.refresh(True, True)
         self.assertEqual(self.f.requests, 1)
         self.assertEqual((new_path / ".yiyan-screen/wallpaper.png").read_bytes(), PNG)
+
+    def test_directory_migration_preserves_a_different_staged_destination_sentence(self):
+        self.refresh()
+        dest = self.open_output_directory_dialog()
+        stage = dest / ".yiyan-work-123-1"
+        stage.mkdir(parents=True)
+        marker = dest / (self.date + ".attempt")
+        marker.write_text(self.date + "\n" + stage.name + "\n")
+        staged_quote = {"date": self.date, "owner": "yiyan.koplugin",
+                        "payload": {"hitokoto": "目录里已有另一句"}}
+        staged_path = stage / "data"
+        staged_path.write_text(json.dumps(staged_quote))
+        self.lua.execute("pending_save()")
+        self.assertIn("新目录已有不同的今日壁纸数据", self.f.message)
+        self.assertIsNone(self.f.settings.data.yiyan_save_dir)
+        self.assertEqual(json.loads(staged_path.read_text()), staged_quote)
+        self.assertFalse(marker.with_suffix(".json").exists())
 
     def test_foreign_cache_is_preserved_before_and_during_request(self):
         path = self.path / (self.date + ".json")
@@ -1016,6 +1122,7 @@ class PluginTests(unittest.TestCase):
         self.cache()
         self.lua.execute(r'''
             function f.settings:flush()
+                if self.data.yiyan_screensaver_backup == nil and self.data.screensaver_type == nil then return end
                 f.flushes = (f.flushes or 0) + 1
                 assert(self.data.yiyan_screensaver_backup)
                 assert(self.data.screensaver_type == "random_image")
@@ -1093,7 +1200,7 @@ class PluginTests(unittest.TestCase):
         self.lua.globals().test_clock = int(datetime(2026, 11, 4, 15, 59, 45, tzinfo=timezone.utc).timestamp())
         self.refresh()
         self.assertEqual(self.f.requests, 0)
-        self.assertIsNone(self.f.settings.data.yiyan_attempt_history[self.date])
+        self.assertIsNone(self.f.settings.data.yiyan_attempt_history)
         self.assertFalse((self.path / (self.date + ".attempt")).exists())
         self.lua.execute("test_clock = test_clock + 20")
         self.refresh()

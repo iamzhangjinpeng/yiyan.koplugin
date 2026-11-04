@@ -25,6 +25,7 @@ local Yiyan = WidgetContainer:extend{ name = "yiyan" }
 local SAVE_DIR = "/mnt/us/koreader/screenshots/yiyan/"
 local STARTUP_DELAY = 8
 local CHECK_INTERVAL = 5 * 60
+local RATE_LIMIT_INTERVAL = 60 * 60
 local HTTP_TIMEOUT = 20
 local POLL_INTERVAL = 0.125
 local UTC_OFFSET = 8 * 3600 -- 一言壁纸统一按北京时间归档
@@ -32,8 +33,8 @@ local DAY_SECONDS = 24 * 60 * 60
 
 local SETTING_AUTO = "yiyan_auto_screensaver"
 local SETTING_BACKUP = "yiyan_screensaver_backup"
-local SETTING_LAST_ATTEMPT = "yiyan_last_attempt_date"
 local SETTING_ATTEMPT_HISTORY = "yiyan_attempt_history"
+local SETTING_RATE_LIMIT = "yiyan_rate_limited_until"
 local SETTING_SAVE_DIR = "yiyan_save_dir"
 local SETTING_CATEGORIES = "yiyan_categories"
 local CACHE_OWNER = "yiyan.koplugin"
@@ -121,17 +122,82 @@ local function saveCache(dir, cached)
     return ok and type(raw) == "string" and writeAtomic(dir .. cached.date .. ".json", raw)
 end
 
-local function attemptStageName(date, marker)
-    return marker and marker:match("^" .. date .. "\n(%.yiyan%-work%-%d+%-%d+)\n$")
+local function parseAttempt(date, marker)
+    if not marker then return end
+    local prefix = date .. "\n"
+    if marker == prefix .. "success\n" then return { success = true } end
+    if marker == prefix then return {} end -- legacy reservation, outcome unknown
+    local name = marker:match("^" .. prefix .. "(%.yiyan%-work%-%d+%-%d+)\n$")
+    if name then return { stage = name } end
+    local retry_at = marker:match("^" .. prefix .. "(%d+)\n$")
+    if retry_at then return { retry_at = tonumber(retry_at) } end
+    retry_at, name = marker:match("^" .. prefix .. "(%d+)\n(%.yiyan%-work%-%d+%-%d+)\n$")
+    if retry_at then return { retry_at = tonumber(retry_at), stage = name } end
 end
 
-local function isAttemptMarker(date, marker)
-    return marker == date .. "\n" or attemptStageName(date, marker) ~= nil
+local function readAttempt(dir, date)
+    local path = dir .. date .. ".attempt"
+    local mode = lfs.symlinkattributes(path, "mode")
+    return mode == "file" and parseAttempt(date, readFile(path)) or nil, mode
 end
 
 local function attemptHistory()
     local history = G_reader_settings:readSetting(SETTING_ATTEMPT_HISTORY)
     return type(history) == "table" and history or {}
+end
+
+local function saveAttemptHistory(date, status)
+    local history = attemptHistory()
+    if history[date] ~= status then
+        history[date] = status
+        G_reader_settings:saveSetting(SETTING_ATTEMPT_HISTORY, history)
+        G_reader_settings:flush()
+    end
+end
+
+local function wasSuccessful(status)
+    return status == "success" or status == "cancelled_success"
+end
+
+local function writeSuccessMarker(dir, date)
+    local attempt, mode = readAttempt(dir, date)
+    if attempt and attempt.success then return true end
+    if not mode or attempt then
+        return writeAtomic(dir .. date .. ".attempt", date .. "\nsuccess\n")
+    end
+end
+
+local function rememberSuccess(dir, date)
+    saveAttemptHistory(date, "success")
+    return writeSuccessMarker(dir, date)
+end
+
+local function readStagedResponse(path, date)
+    if lfs.symlinkattributes(path, "mode") ~= "file" then return end
+    local raw = readFile(path)
+    local record = decodeCache(raw, date)
+    if record and record.owner == CACHE_OWNER then return record, raw end
+end
+
+local function loadStagedCache(dir, date)
+    local status = attemptHistory()[date]
+    if status == "cancelled" or status == "cancelled_success" then return end
+    local attempt = readAttempt(dir, date)
+    local name = attempt and attempt.stage
+    if not name then return end
+    local work_dir = dir .. name
+    if lfs.symlinkattributes(work_dir, "mode") ~= "directory" then return end
+    for _, name in ipairs({ "/data", "/data.partial" }) do
+        local path = work_dir .. name
+        local record, raw = readStagedResponse(path, date)
+        -- A failed local rename can leave a complete, usable response.
+        if record then return { record = record, path = path, dir = work_dir, raw = raw } end
+    end
+end
+
+local function sameSentence(a, b)
+    return a.hitokoto == b.hitokoto and a.uuid == b.uuid
+        and (a.from or "") == (b.from or "") and (a.from_who or "") == (b.from_who or "")
 end
 
 local function rememberDirectoryAttempts(dir)
@@ -140,34 +206,19 @@ local function rememberDirectoryAttempts(dir)
     if not ok then return false end
     local history = attemptHistory()
     for name in entries, handle do
-        local date = name:match("^(%d%d%d%d%d%d%d%d)%.attempt$")
-        if date and not history[date] then
-            local path = dir .. name
-            if lfs.symlinkattributes(path, "mode") == "file" and isAttemptMarker(date, readFile(path)) then
-                history[date] = true
+        local date = name:match("^(%d%d%d%d%d%d%d%d)%.attempt$") or name:match("^(%d%d%d%d%d%d%d%d)%.json$")
+        if date and not wasSuccessful(history[date]) then
+            local attempt = readAttempt(dir, date)
+            if (attempt and attempt.success) or loadCache(dir, date) or loadStagedCache(dir, date) then
+                history[date] = "success"
+            elseif history[date] ~= "cancelled" and attempt and attempt.retry_at and attempt.retry_at > os.time() then
+                local previous = type(history[date]) == "number" and history[date] or 0
+                history[date] = math.max(previous, attempt.retry_at)
             end
         end
     end
     G_reader_settings:saveSetting(SETTING_ATTEMPT_HISTORY, history)
     return true
-end
-
-local function loadStagedCache(dir, date)
-    if attemptHistory()[date] == "cancelled" then return end
-    local marker = dir .. date .. ".attempt"
-    if lfs.symlinkattributes(marker, "mode") ~= "file" then return end
-    local attempt = readFile(marker)
-    local name = attemptStageName(date, attempt)
-    if not name then return end
-    local work_dir = dir .. name
-    local path = work_dir .. "/data"
-    if lfs.symlinkattributes(work_dir, "mode") ~= "directory"
-        or lfs.symlinkattributes(path, "mode") ~= "file" then return end
-    local raw = readFile(path)
-    local record = decodeCache(raw, date)
-    if record and record.owner == CACHE_OWNER then
-        return { record = record, path = path, dir = work_dir, raw = raw }
-    end
 end
 
 local function encodeResponse(raw, date)
@@ -384,6 +435,10 @@ function Yiyan:onResume()
     if not self._stopped then self:_schedule(2) end
 end
 
+function Yiyan:onNetworkConnected()
+    if active_instance == self and not self._stopped then self:_schedule(2) end
+end
+
 function Yiyan:onCloseWidget()
     self._stopped = true
     if self._check_callback then UIManager:unschedule(self._check_callback); self._check_callback = nil end
@@ -427,7 +482,7 @@ function Yiyan:requestSentence(date, response_path, work_dir, callback)
             local request_ok, code = http.request{
                 url = url,
                 method = "GET",
-                headers = { ["User-Agent"] = "KOReader-yiyan.koplugin/1.2.5" },
+                headers = { ["User-Agent"] = "KOReader-yiyan.koplugin/1.2.6" },
                 redirect = false,
                 sink = function(chunk, sink_err)
                     if sink_err then return nil, sink_err end
@@ -452,7 +507,7 @@ function Yiyan:requestSentence(date, response_path, work_dir, callback)
                     -- restart. Only the status needs to go through the pipe.
                     result = "ok"
                 else
-                    result = "ERR\nwrite_error"
+                    result = "ERR\nreceived_unstored"
                 end
             end
         end)
@@ -493,17 +548,24 @@ function Yiyan:requestSentence(date, response_path, work_dir, callback)
         active_worker = nil
         UIManager:allowStandby()
         local read_ok, response = pcall(ffiutil.readAllFromFD, read_fd)
-        os.remove(partial)
+        local staged = lfs.symlinkattributes(response_path, "mode") == "file"
+            or readStagedResponse(partial, date) ~= nil
         if worker.cancelled then
+            local received = staged or (read_ok and response == "ERR\nreceived_unstored")
+            os.remove(partial)
             discardStage(response_path, work_dir)
+            if received then callback(false, "cancelled_success") end
             return
         end
-        if lfs.symlinkattributes(response_path, "mode") == "file" then
+        if staged then
             callback(true)
             return
         end
+        os.remove(partial)
         discardStage(response_path, work_dir)
-        if worker.timed_out then
+        if read_ok and response == "ERR\nreceived_unstored" then
+            callback(false, "received_unstored")
+        elseif worker.timed_out then
             callback(false, "timeout")
         elseif read_ok and type(response) == "string" then
             callback(false, response:match("^ERR\n(.*)") or "network_error")
@@ -605,7 +667,9 @@ function Yiyan:cleanupOldImages(dir, keep_date)
                 -- Keep the ownership record alongside a replacement. Without
                 -- it, a clock rollback could mistake the PNG for a legacy one.
                 if not mode or (matchesRecordedDigest(digest, cached) and os.remove(path)) then
-                    os.remove(dir .. name)
+                    -- Upgrade legacy attempts before deleting their only proof
+                    -- of a successful request.
+                    if rememberSuccess(dir, date) then os.remove(dir .. name) end
                 end
             end
         end
@@ -628,12 +692,14 @@ function Yiyan:refreshDaily(show_message, force_render, cache_only)
     local function finishResponse()
         local staged = loadStagedCache(dir, date)
         if not staged then return false end
+        saveAttemptHistory(date, "success")
         if lfs.symlinkattributes(cache_path, "mode") or lfs.symlinkattributes(image_path, "mode") then
             notify(_("发现同名文件，已保留原文件和今日句子，请移走冲突文件后重试"))
         elseif not os.rename(staged.path, cache_path) then
             notify(_("句子已保留，请检查存储空间后离线重新生成"))
         else
             discardStage(staged.path, staged.dir)
+            rememberSuccess(dir, date)
             if todayDate() == date then self:_renderCache(dir, staged.record, image_path, show_message) end
         end
         return true
@@ -645,6 +711,7 @@ function Yiyan:refreshDaily(show_message, force_render, cache_only)
         notify(_("同名 JSON 无法识别为一言缓存，请移走后再生成"))
         return
     end
+    if cached then rememberSuccess(dir, date) end
     local valid_image = Wallpaper.isValidPNG(image_path)
     if valid_image and not force_render
         and (not cached or (not cached.pending_image and cached.layout_version == Wallpaper.VERSION)) then
@@ -652,6 +719,7 @@ function Yiyan:refreshDaily(show_message, force_render, cache_only)
             notify(_("同名图片无法确认归属，请移走后再重新生成"))
             return
         end
+        if not cached then rememberSuccess(dir, date) end
         local published = publishWallpaper(dir, image_path)
         if published and autoScreensaverEnabled() then configureScreensaver(dir) end
         notify(published and _("今日一言壁纸已存在") or _("图片已生成，但未能更新屏保文件"))
@@ -661,22 +729,38 @@ function Yiyan:refreshDaily(show_message, force_render, cache_only)
     -- if today's image is missing or the template changed since it was saved.
     if cached then self:_renderCache(dir, cached, image_path, show_message); return end
     if valid_image then
+        rememberSuccess(dir, date)
         notify(_("今日图片来自旧版，未缓存句子；保留原图，明天自动使用新模板"))
         return
     end
     if cache_only then notify(_("暂无今日句子缓存")); return end
-    if lfs.attributes(image_path, "mode") then
+    if lfs.symlinkattributes(image_path, "mode") then
         notify(_("同名图片无法确认归属，请移走后再生成"))
         return
     end
+    local marker, marker_mode = readAttempt(dir, date)
     local history = attemptHistory()
-    local previous_attempt = G_reader_settings:readSetting(SETTING_LAST_ATTEMPT)
-    if history[date] or previous_attempt == date or lfs.symlinkattributes(attempt_path, "mode") then
-        notify(_("今天已请求过一言，明天再试"))
+    if (marker and marker.success) or wasSuccessful(history[date]) then
+        notify(_("今日已成功获取一言，但本地句子缓存不可用"))
+        return
+    end
+    if marker_mode and not marker then
+        notify(_("同名请求记录无法识别，请移走后再生成"))
         return
     end
     if not networkIsConnected() then
         notify(_("网络未连接，今日请求尚未发出"))
+        return
+    end
+    local now = os.time()
+    local rate_limited_until = G_reader_settings:readSetting(SETTING_RATE_LIMIT)
+    if type(rate_limited_until) == "number" and now < rate_limited_until then
+        notify(_("一言服务暂时限流，稍后会自动重试"))
+        return
+    end
+    local saved_retry = type(history[date]) == "number" and history[date] or 0
+    if now < math.max(marker and marker.retry_at or 0, saved_retry) then
+        notify(_("上次请求未完成，稍后会自动重试"))
         return
     end
 
@@ -686,48 +770,59 @@ function Yiyan:refreshDaily(show_message, force_render, cache_only)
         notify(_("无法创建句子临时文件，请检查存储空间和目录权限"))
         return
     end
-    local attempt = date .. "\n" .. work_dir:match("[^/]+$") .. "\n"
+    local retry_at = now + CHECK_INTERVAL
+    local attempt = date .. "\n" .. retry_at .. "\n" .. work_dir:match("[^/]+$") .. "\n"
     if not writeAtomic(attempt_path, attempt) then
         discardStage(response_path, work_dir)
         notify(_("无法保存请求记录，请检查存储空间和目录权限"))
         return
     end
-    if type(previous_attempt) == "string" and not history[previous_attempt] then
-        history[previous_attempt] = true
+    saveAttemptHistory(date, nil)
+    local function ownsAttempt()
+        return lfs.symlinkattributes(attempt_path, "mode") == "file" and readFile(attempt_path) == attempt
     end
-    history[date] = true
-    G_reader_settings:saveSetting(SETTING_ATTEMPT_HISTORY, history)
-    G_reader_settings:saveSetting(SETTING_LAST_ATTEMPT, date)
-    G_reader_settings:flush()
     self._busy = true
     self:requestSentence(date, response_path, work_dir, function(received, err)
         self._busy = false
         if err == "cancelled" then
             -- Revoke the response pointer before KOReader can exit and drop
-            -- the poll callback. A date-only marker still blocks another GET.
-            if lfs.symlinkattributes(attempt_path, "mode") == "file"
-                and readFile(attempt_path) == attempt
-                and not writeFile(attempt_path, date .. "\n") then
-                history[date] = "cancelled"
-                G_reader_settings:saveSetting(SETTING_ATTEMPT_HISTORY, history)
-                G_reader_settings:flush()
+            -- the poll callback. Preserve a known success without publishing it.
+            if ownsAttempt() then
+                local staged = loadStagedCache(dir, date)
+                local marker_data = date .. "\n" .. (staged and "success" or retry_at) .. "\n"
+                local revoked = writeAtomic(attempt_path, marker_data)
+                if staged then
+                    saveAttemptHistory(date, revoked and "success" or "cancelled_success")
+                elseif not revoked then
+                    saveAttemptHistory(date, "cancelled")
+                end
             end
+        elseif err == "cancelled_success" then
+            saveAttemptHistory(date, writeSuccessMarker(dir, date) and "success" or "cancelled_success")
         elseif err == "not_started" or err == "stale_date" then
             -- Clear only the reservation we wrote, and only when the worker
             -- confirmed that no request could have been made.
-            if lfs.symlinkattributes(attempt_path, "mode") == "file"
-                and readFile(attempt_path) == attempt and os.remove(attempt_path) then
-                history[date] = nil
-                G_reader_settings:saveSetting(SETTING_LAST_ATTEMPT, previous_attempt)
-                G_reader_settings:flush()
-            end
+            if ownsAttempt() then os.remove(attempt_path) end
             notify(err == "stale_date" and _("临近北京时间零点，将在下次检查时更新")
                 or _("后台任务未能启动，可稍后重试"))
+        elseif err == "received_unstored" then
+            rememberSuccess(dir, date)
+            notify(_("已收到今日句子，但无法保存，请检查存储空间和目录权限"))
         elseif not received then
             logger.warn("Yiyan: daily request failed", tostring(err))
-            notify(_("今日一言请求失败；为避免重复请求，明天再试"))
+            if err == "http_429" then
+                local limited_until = os.time() + RATE_LIMIT_INTERVAL
+                -- Service throttling also applies after the Beijing date changes.
+                G_reader_settings:saveSetting(SETTING_RATE_LIMIT, limited_until)
+                G_reader_settings:flush()
+                if ownsAttempt() then writeAtomic(attempt_path, date .. "\n" .. limited_until .. "\n") end
+                notify(_("一言服务暂时限流，一小时后再试"))
+            else
+                notify(_("今日一言请求失败，稍后会自动重试"))
+            end
         elseif not finishResponse() then
-            notify(_("无法读取今日句子；为避免重复请求，明天再试"))
+            saveAttemptHistory(date, "success")
+            notify(_("已收到今日句子，但暂时无法读取缓存"))
         end
     end)
 end
@@ -771,10 +866,14 @@ function Yiyan:chooseOutputDirectory()
                         return
                     end
                     local staged = loadStagedCache(old_dir, date)
+                    local destination_staged = loadStagedCache(dir, date)
                     local source_cache, source_conflict = loadCache(old_dir, date)
                     local staged_only = staged and not source_cache
+                    local source_record = source_cache or (staged and staged.record)
+                    local stage_matches = destination_staged and source_record
+                        and sameSentence(destination_staged.record.payload, source_record.payload)
                     local copies = {}
-                    for index, suffix in ipairs({ ".png", ".json", ".attempt" }) do
+                    for _index, suffix in ipairs({ ".png", ".json", ".attempt" }) do
                         local name = date .. suffix
                         local data
                         if staged_only then
@@ -783,15 +882,21 @@ function Yiyan:chooseOutputDirectory()
                             if suffix == ".json" then
                                 data = staged.raw
                             elseif suffix == ".attempt" then
-                                data = date .. "\n"
+                                data = date .. "\nsuccess\n"
                             end
                         elseif suffix == ".attempt" or not source_conflict then
                             local source_path = old_dir .. name
                             if lfs.symlinkattributes(source_path, "mode") == "file" then
                                 data = readFile(source_path)
                             end
-                            if suffix == ".attempt" and not isAttemptMarker(date, data) then
-                                data = nil
+                            if suffix == ".attempt" then
+                                local attempt = parseAttempt(date, data)
+                                -- A staging directory belongs to the source.
+                                if not attempt then
+                                    data = nil
+                                elseif attempt.stage then
+                                    data = date .. "\n" .. (attempt.retry_at and (attempt.retry_at .. "\n") or "")
+                                end
                             elseif suffix == ".png" and data then
                                 local recorded = source_cache and (source_cache.owner or source_cache.image_digest)
                                 if (recorded and not matchesRecordedDigest(md5(data), source_cache))
@@ -801,9 +906,10 @@ function Yiyan:chooseOutputDirectory()
                         local target = dir .. name
                         local mode = lfs.symlinkattributes(target, "mode")
                         local existing = mode == "file" and readFile(target) or nil
-                        local same_attempt = suffix == ".attempt" and isAttemptMarker(date, data)
-                            and isAttemptMarker(date, existing)
-                        if data and mode and data ~= existing and not same_attempt then
+                        local same_attempt = suffix == ".attempt" and parseAttempt(date, data)
+                            and parseAttempt(date, existing)
+                        if data and ((mode and data ~= existing and not same_attempt)
+                            or (destination_staged and suffix ~= ".attempt" and not stage_matches)) then
                             UIManager:show(InfoMessage:new{ text = _("新目录已有不同的今日壁纸数据，请选择其他目录") })
                             return
                         end
