@@ -535,7 +535,7 @@ function Yiyan:requestSentence(date, response_path, work_dir, replacement, callb
             local request_ok, code = http.request{
                 url = url,
                 method = "GET",
-                headers = { ["User-Agent"] = "KOReader-yiyan.koplugin/1.2.8" },
+                headers = { ["User-Agent"] = "KOReader-yiyan.koplugin/1.2.9" },
                 redirect = false,
                 sink = function(chunk, sink_err)
                     if sink_err then return nil, sink_err end
@@ -601,13 +601,17 @@ function Yiyan:requestSentence(date, response_path, work_dir, replacement, callb
         active_worker = nil
         UIManager:allowStandby()
         local read_ok, response = pcall(ffiutil.readAllFromFD, read_fd)
+        local err = read_ok and type(response) == "string" and response:match("^ERR\n([%w_]+)$")
         local staged = lfs.symlinkattributes(response_path, "mode") == "file"
             or readStagedResponse(partial, date) ~= nil
         if worker.cancelled then
-            local received = staged or (read_ok and response == "ERR\nreceived_unstored")
             os.remove(partial)
             discardStage(response_path, work_dir)
-            if received then callback(false, "cancelled_success") end
+            if staged or err == "received_unstored" then
+                callback(false, "cancelled_success")
+            elseif err == "http_429" then
+                callback(false, err)
+            end
             return
         end
         if staged then
@@ -616,14 +620,11 @@ function Yiyan:requestSentence(date, response_path, work_dir, replacement, callb
         end
         os.remove(partial)
         discardStage(response_path, work_dir)
-        if read_ok and response == "ERR\nreceived_unstored" then
-            callback(false, "received_unstored")
-        elseif worker.timed_out then
+        -- A complete rate-limit status must survive a race with termination.
+        if worker.timed_out and err ~= "http_429" and err ~= "received_unstored" and err ~= "stale_date" then
             callback(false, "timeout")
-        elseif read_ok and type(response) == "string" then
-            callback(false, response:match("^ERR\n(.*)") or "network_error")
         else
-            callback(false, "network_error")
+            callback(false, err or "network_error")
         end
     end
     worker.cancel = function()

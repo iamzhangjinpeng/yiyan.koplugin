@@ -483,6 +483,31 @@ class PluginTests(unittest.TestCase):
         self.assertEqual(self.f.requests, 2)
         self.assertTrue((self.path / "20261105.png").exists())
 
+    def test_rate_limit_already_received_survives_worker_timeout(self):
+        self.f.http_code, self.f.hung = 429, True
+        self.obj.refreshDaily(self.obj, True)
+        self.assertEqual(self.f.pipe, "ERR\nhttp_429")
+        self.f.now = 25
+        self.f.drain(self.f)
+        self.assertEqual(self.f.kills, 1)
+        self.f.http_code, self.f.hung = 200, False
+        self.lua.execute("test_clock = test_clock + 300")
+        self.refresh()
+        self.assertEqual(self.f.requests, 1)
+        self.assertIn("服务暂时限流", self.f.message)
+
+    def test_rate_limit_already_received_survives_worker_cancellation(self):
+        self.f.http_code, self.f.hung = 429, True
+        self.obj.refreshDaily(self.obj, True)
+        self.obj.stopPlugin(self.obj)
+        self.f.drain(self.f)
+        self.f.http_code, self.f.hung = 200, False
+        self.lua.execute("plugin = loadPlugin(); obj = newPlugin(); test_clock = test_clock + 300")
+        self.obj = self.lua.globals().obj
+        self.refresh()
+        self.assertEqual(self.f.requests, 1)
+        self.assertIn("服务暂时限流", self.f.message)
+
     def test_worker_start_failure_releases_unspent_attempt(self):
         settings = self.f.settings.data
         settings.yiyan_last_attempt_date = "20000101"
