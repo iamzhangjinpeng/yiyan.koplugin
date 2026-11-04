@@ -47,13 +47,17 @@ function bb.new(w, h)
     function image:blitFrom() end
     function image:ditherblitFrom() self.dithered = true end
     function image:paintRect(_, y, _, h) assert(y + h == self.h) end
-    function image:writeToFile(path, format, _, grayscale)
-        assert(format == "png" and grayscale == true)
+    function image:writeToFile(path, format)
+        assert(format == "png")
         assert(self.dithered, "export must use 16-tone e-ink dithering")
         if f.fail_render then return false end
-        local out = assert(io.open(path, "wb")); out:write(test_png); out:close()
+        local out = assert(io.open(path, "wb"))
+        out:write(f.truncate_png and "truncated" or test_png)
+        out:close()
+        if f.fail_encode then return true, false, "disk full" end
         f.renders = f.renders + 1
-        return true
+        f.export_width, f.export_height = self.w, self.h
+        return true, true
     end
     return image
 end
@@ -120,8 +124,11 @@ local modules = {
         end,
         scaleBlitBuffer = function(_, image, w, h) image:free(); return bb.new(w, h) end,
     },
-    ["device"] = { screen = { getWidth = function() return 758 end, getHeight = function() return 1024 end } },
-    ["util"] = { makePath = py_mkdir },
+    ["device"] = { screen = {
+        getWidth = function() return f.screen_width or 758 end,
+        getHeight = function() return f.screen_height or 1024 end,
+    } },
+    ["util"] = { makePath = function(path) py_mkdir(path); return true end },
     ["ffi/util"] = ffi,
     ["socket.http"] = http,
     ["socketutil"] = { set_timeout = function() end },
@@ -129,6 +136,9 @@ local modules = {
     ["ui/time"] = { to_s = function(v) return v end, boottime_or_monotonic = function() return f.now end },
     ["logger"] = { warn = function() end },
     ["json"] = { encode = py_encode, decode = py_decode },
+    ["ffi/sha2"] = { md5 = function(data)
+        return (data:gsub(".", function(c) return string.format("%02x", c:byte()) end))
+    end },
     ["gettext"] = function(v) return v end,
     ["libs/libkoreader-lfs"] = {
         attributes = py_mode,
@@ -193,7 +203,7 @@ class PluginTests(unittest.TestCase):
     def test_success_is_requested_only_once_even_after_settings_reset(self):
         self.refresh()
         self.assertTrue((self.path / (self.date + ".png")).exists())
-        self.assertEqual(json.loads((self.path / (self.date + ".json")).read_text())["layout_version"], 2)
+        self.assertEqual(json.loads((self.path / (self.date + ".json")).read_text())["layout_version"], 3)
         self.f.settings.data = self.lua.table()
         self.refresh()
         self.assertEqual(self.f.requests, 1)
@@ -297,6 +307,107 @@ class PluginTests(unittest.TestCase):
         self.obj.init(self.obj)
         self.assertTrue(old._stopped)
         self.assertEqual(len(self.f.queue), 1)
+
+    def test_cleanup_checks_ownership_and_leaves_replaced_images(self):
+        self.cache()
+        records = {
+            "20000101": {},
+            "20000102": {"owner": "yiyan.koplugin", "image_digest": PNG.hex()},
+            "20000103": {"owner": "yiyan.koplugin", "image_digest": PNG.hex()},
+        }
+        for date, flags in records.items():
+            (self.path / (date + ".json")).write_text(json.dumps({
+                "date": date, "payload": self.payload, **flags,
+            }))
+            (self.path / (date + ".png")).write_bytes(PNG if date != "20000103" else b"user image")
+        self.refresh()
+        self.assertTrue((self.path / "20000101.png").exists())
+        self.assertTrue((self.path / "20000101.json").exists())
+        self.assertFalse((self.path / "20000102.png").exists())
+        self.assertFalse((self.path / "20000102.json").exists())
+        self.assertEqual((self.path / "20000103.png").read_bytes(), b"user image")
+        display = self.path / ".yiyan-screen"
+        self.assertEqual([p.name for p in display.iterdir()], ["wallpaper.png"])
+
+    def test_encoder_error_or_truncation_preserves_previous_png(self):
+        target = self.path / (self.date + ".png")
+        target.write_bytes(PNG)
+        self.cache(1)
+        self.f.truncate_png = True
+        for encoder_error in (True, False):
+            with self.subTest(encoder_error=encoder_error):
+                self.f.fail_encode = encoder_error
+                self.refresh()
+                self.assertEqual(target.read_bytes(), PNG)
+                self.assertFalse(target.with_suffix(".png.tmp").exists())
+
+    def test_offline_start_keeps_original_screensaver_until_image_is_ready(self):
+        self.f.connected = False
+        self.f.settings.data["screensaver_type"] = "cover"
+        self.obj.init(self.obj)
+        self.obj.refreshDaily(self.obj, True)
+        self.assertEqual(self.f.settings.data["screensaver_type"], "cover")
+        self.assertIsNone(self.f.settings.data["yiyan_screensaver_backup"])
+        self.cache()
+        self.obj.refreshDaily(self.obj, True)
+        self.assertEqual(self.f.settings.data["screensaver_type"], "random_image")
+        self.assertEqual(self.f.settings.data["screensaver_dir"], str(self.path / ".yiyan-screen") + "/")
+        self.obj.stopPlugin(self.obj)
+        self.assertEqual(self.f.settings.data["screensaver_type"], "cover")
+
+    def test_landscape_reader_renders_portrait_wallpaper(self):
+        self.cache(2)
+        (self.path / (self.date + ".png")).write_bytes(PNG)
+        self.f.screen_width, self.f.screen_height = 1024, 758
+        self.refresh()
+        self.assertEqual((self.f.export_width, self.f.export_height), (758, 1024))
+        self.assertEqual(self.f.requests, 0)
+
+    def test_directory_save_waits_for_active_request(self):
+        # The timer can start a request while the directory dialog is open.
+        new_path = self.path / "new-output"
+        self.lua.globals().test_next_dir = str(new_path)
+        self.lua.execute(r'''
+            local function map(path)
+                local prefix = "/mnt/us/test/"
+                if path:sub(1, #prefix) == prefix then
+                    return test_next_dir .. "/" .. path:sub(#prefix + 1)
+                end
+                return path
+            end
+            local open, rename, remove = io.open, os.rename, os.remove
+            io.open = function(path, ...) return open(map(path), ...) end
+            os.rename = function(src, dst) return rename(map(src), map(dst)) end
+            os.remove = function(path) return remove(map(path)) end
+            package.loaded["util"].makePath = function(path)
+                py_mkdir(map(path))
+                return true
+            end
+            local ui = package.loaded["ui/uimanager"]
+            ui.close = function() end
+            package.loaded["ui/widget/inputdialog"].new = function(_, options)
+                options.getInputText = function() return "/mnt/us/test/" end
+                options.onShowKeyboard = function() end
+                pending_save = options.buttons[1][2].callback
+                return options
+            end
+            obj:chooseOutputDirectory()
+            obj:refreshDaily(true)
+            pending_save()
+        ''')
+        self.assertIsNone(self.f.settings.data["yiyan_save_dir"])
+        self.assertIn("请等待", self.f.message)
+        self.f.drain(self.f)
+        self.assertTrue((self.path / (self.date + ".png")).exists())
+        self.assertTrue((self.path / (self.date + ".json")).exists())
+        self.lua.execute("pending_save()")
+        self.assertEqual(self.f.settings.data["yiyan_save_dir"], "/mnt/us/test/")
+        for suffix in (".png", ".json", ".attempt"):
+            name = self.date + suffix
+            self.assertEqual((new_path / name).read_bytes(), (self.path / name).read_bytes())
+        self.assertEqual((new_path / ".yiyan-screen/wallpaper.png").read_bytes(), PNG)
+        self.refresh()
+        self.assertEqual(self.f.requests, 1)
 
 
 if __name__ == "__main__":

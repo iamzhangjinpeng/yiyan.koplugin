@@ -6,7 +6,20 @@ local TextBoxWidget = require("ui/widget/textboxwidget")
 local Font = require("ui/font")
 local logger = require("logger")
 
-local Wallpaper = { VERSION = 2 }
+local Wallpaper = { VERSION = 3 }
+
+function Wallpaper.isValidPNG(path)
+    local file = io.open(path, "rb")
+    if not file then return false end
+    local head = file:read(8)
+    local size = file:seek("end")
+    local tail
+    if size and size >= 32 and file:seek("end", -12) then
+        tail = file:read(12)
+    end
+    file:close()
+    return head == "\137PNG\r\n\26\n" and tail == "\0\0\0\0IEND\174\66\96\130"
+end
 
 local function round(value) return math.floor(value + 0.5) end
 
@@ -108,7 +121,9 @@ function Wallpaper.render(plugin_path, payload, date, target, width, height)
         eink:ditherblitFrom(image, 0, 0, 0, 0, width, height)
         image:free()
         image, eink = eink, nil
-        assert(image:writeToFile(tmp, "png", 90, true), "Cannot write the wallpaper PNG")
+        local called, written, err = image:writeToFile(tmp, "png")
+        assert(called and written ~= false, err or written or "Cannot write the wallpaper PNG")
+        assert(Wallpaper.isValidPNG(tmp), "Incomplete wallpaper PNG")
         assert(os.rename(tmp, target), "Cannot replace the wallpaper PNG")
         return true
     end)

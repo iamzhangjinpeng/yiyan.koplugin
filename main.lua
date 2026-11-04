@@ -13,6 +13,7 @@ local socketutil = require("socketutil")
 local NetworkMgr = require("ui/network/manager")
 local logger = require("logger")
 local json = require("json")
+local md5 = require("ffi/sha2").md5
 local time = require("ui/time")
 local _ = require("gettext")
 local plugin_dir = debug.getinfo(1, "S").source:match("^@(.*/)") or "plugins/yiyan.koplugin/"
@@ -35,10 +36,10 @@ local SETTING_SAVE_DIR = "yiyan_save_dir"
 local active_worker
 local active_instance
 local function workerNow() return time.to_s(time.boottime_or_monotonic()) end
-local function todayInfo()
+local function todayDate()
     local t = os.date("!*t", os.time() + UTC_OFFSET)
     local date = string.format("%04d%02d%02d", t.year, t.month, t.day)
-    return date, SAVE_DIR .. date .. ".png"
+    return date
 end
 
 local function fileExists(path)
@@ -70,24 +71,13 @@ local function writeAtomic(path, data)
     return true
 end
 
-local function validPNG(path)
-    local f = io.open(path, "rb")
-    if not f then return false end
-    local head = f:read(8)
-    local size = f:seek("end")
-    local tail
-    if size and size >= 32 then f:seek("end", -12); tail = f:read(12) end
-    f:close()
-    return head == "\137PNG\r\n\26\n" and tail == "\0\0\0\0IEND\174\66\96\130"
-end
-
 local function validPayload(payload)
     return type(payload) == "table" and type(payload.hitokoto) == "string"
         and payload.hitokoto:match("%S") ~= nil and #payload.hitokoto <= 8192
 end
 
-local function loadCache(date)
-    local raw = readFile(SAVE_DIR .. date .. ".json")
+local function loadCache(dir, date)
+    local raw = readFile(dir .. date .. ".json")
     if not raw then return nil end
     local ok, cached = pcall(json.decode, raw)
     if ok and type(cached) == "table" and cached.date == date and validPayload(cached.payload) then
@@ -95,9 +85,9 @@ local function loadCache(date)
     end
 end
 
-local function saveCache(cached)
+local function saveCache(dir, cached)
     local ok, raw = pcall(json.encode, cached)
-    return ok and type(raw) == "string" and writeAtomic(SAVE_DIR .. cached.date .. ".json", raw)
+    return ok and type(raw) == "string" and writeAtomic(dir .. cached.date .. ".json", raw)
 end
 
 local function networkIsConnected()
@@ -118,7 +108,33 @@ local function setAutoScreensaver(enabled)
     G_reader_settings:flush()
 end
 
-local function configureScreensaver()
+-- KOReader chooses a random image in this directory. Publish only the
+-- current wallpaper here so older or user-supplied files cannot be selected.
+local function screensaverDir(dir)
+    return dir .. ".yiyan-screen/"
+end
+
+local function publishWallpaper(dir, path)
+    local display_dir = screensaverDir(dir)
+    local target = display_dir .. "wallpaper.png"
+    local data = readFile(path)
+    if not data then return false end
+    if readFile(target) == data then return true end
+    util.makePath(display_dir)
+    return writeAtomic(target, data)
+end
+
+local function configureScreensaver(dir)
+    local display_dir = screensaverDir(dir)
+    if not Wallpaper.isValidPNG(display_dir .. "wallpaper.png") then return false end
+    local settings = G_reader_settings
+    if settings:readSetting(SETTING_BACKUP)
+        and settings:readSetting("screensaver_type") == "random_image"
+        and settings:readSetting("screensaver_dir") == display_dir
+        and settings:readSetting("screensaver_stretch_images") == true
+        and settings:readSetting("screensaver_show_message") == false then
+        return true
+    end
     local backup = G_reader_settings:readSetting(SETTING_BACKUP)
     if type(backup) ~= "table" or backup.version ~= 1 then
         local function snapshot(key)
@@ -136,10 +152,11 @@ local function configureScreensaver()
         G_reader_settings:flush()
     end
     G_reader_settings:saveSetting("screensaver_type", "random_image")
-    G_reader_settings:saveSetting("screensaver_dir", SAVE_DIR)
+    G_reader_settings:saveSetting("screensaver_dir", display_dir)
     G_reader_settings:saveSetting("screensaver_stretch_images", true)
     G_reader_settings:saveSetting("screensaver_show_message", false)
     G_reader_settings:flush()
+    return true
 end
 
 local function restoreScreensaver(disable_auto)
@@ -176,7 +193,7 @@ function Yiyan:init()
         SAVE_DIR = configured_dir:gsub("/*$", "") .. "/"
     end
     util.makePath(SAVE_DIR)
-    if autoScreensaverEnabled() then configureScreensaver() else restoreScreensaver(false) end
+    if autoScreensaverEnabled() then configureScreensaver(SAVE_DIR) else restoreScreensaver(false) end
     self:_schedule(STARTUP_DELAY)
 end
 
@@ -207,12 +224,12 @@ function Yiyan:stopPlugin()
     restoreScreensaver(false)
 end
 
-function Yiyan:requestSentence(date, callback)
+function Yiyan:requestSentence(dir, date, callback)
     if active_worker then
         callback(nil, "busy")
         return
     end
-    local response_path = SAVE_DIR .. date .. ".response.tmp"
+    local response_path = dir .. date .. ".response.tmp"
     os.remove(response_path)
     local pid, read_fd
     local started, start_err = pcall(function()
@@ -224,7 +241,7 @@ function Yiyan:requestSentence(date, callback)
                 local request_ok, code = http.request{
                     url = "https://v1.hitokoto.cn/?encode=json",
                     method = "GET",
-                    headers = { ["User-Agent"] = "KOReader-yiyan.koplugin/1.1" },
+                    headers = { ["User-Agent"] = "KOReader-yiyan.koplugin/1.1.1" },
                     redirect = false,
                     sink = function(chunk, sink_err)
                         if sink_err then return nil, sink_err end
@@ -300,35 +317,50 @@ function Yiyan:requestSentence(date, callback)
 end
 
 function Yiyan:renderImage(payload, date, target)
+    local width, height = Device.screen:getWidth(), Device.screen:getHeight()
     return Wallpaper.render(self.path or plugin_dir:gsub("/$", ""), payload, date, target,
-        Device.screen:getWidth(), Device.screen:getHeight())
+        math.min(width, height), math.max(width, height))
 end
 
-function Yiyan:_renderCache(cached, image_path, show_message)
+function Yiyan:_renderCache(dir, cached, image_path, show_message)
     local ok = self:renderImage(cached.payload, cached.date, image_path)
-    if not ok or not validPNG(image_path) then
+    if not ok or not Wallpaper.isValidPNG(image_path) then
         if show_message and not self._stopped then
             UIManager:show(InfoMessage:new{ text = _("图片生成失败，句子已缓存，可稍后离线重新生成") })
         end
         return false
     end
     cached.layout_version = Wallpaper.VERSION
-    saveCache(cached)
-    self:cleanupOldImages(image_path)
-    if show_message and not self._stopped then
-        UIManager:show(InfoMessage:new{ text = _("今日一言壁纸已生成") })
+    cached.owner = "yiyan.koplugin"
+    local image = readFile(image_path)
+    cached.image_digest = image and md5(image)
+    local recorded = saveCache(dir, cached)
+    local published = publishWallpaper(dir, image_path)
+    if published and recorded then self:cleanupOldImages(dir, cached.date) end
+    if published and not self._stopped and autoScreensaverEnabled() then
+        configureScreensaver(dir)
     end
-    return true
+    if show_message and not self._stopped then
+        local message = published and _("今日一言壁纸已生成") or _("图片已生成，但未能更新屏保文件")
+        UIManager:show(InfoMessage:new{ text = message })
+    end
+    return published
 end
 
-function Yiyan:cleanupOldImages(keep_path)
+function Yiyan:cleanupOldImages(dir, keep_date)
     local ok, lfs = pcall(require, "libs/libkoreader-lfs")
-    if not ok then return end
-    for name in lfs.dir(SAVE_DIR) do
-        if name:match("^%d%d%d%d%d%d%d%d%.png$") or name:match("^%d%d%d%d%d%d%d%d%.json$") then
-            local path = SAVE_DIR .. name
-            local keep_stem = keep_path:match("(%d%d%d%d%d%d%d%d)%.png$")
-            if name:sub(1, 8) ~= keep_stem and lfs.attributes(path, "mode") == "file" then os.remove(path) end
+    if not ok or lfs.attributes(dir, "mode") ~= "directory" then return end
+    for name in lfs.dir(dir) do
+        local date = name:match("^(%d%d%d%d%d%d%d%d)%.json$")
+        if date and date < keep_date then
+            local cached = loadCache(dir, date)
+            if cached and cached.owner == "yiyan.koplugin" then
+                local path = dir .. date .. ".png"
+                local image = cached.image_digest and readFile(path)
+                -- Leave legacy images and files replaced by the user alone.
+                local owns_image = image and md5(image) == cached.image_digest
+                if not owns_image or os.remove(path) then os.remove(dir .. name) end
+            end
         end
     end
 end
@@ -339,24 +371,29 @@ function Yiyan:refreshDaily(show_message, force_render, cache_only)
         if show_message and not self._stopped then UIManager:show(InfoMessage:new{ text = message }) end
     end
     if self._busy or active_worker then notify(_("一言任务正在进行中")); return end
-    util.makePath(SAVE_DIR)
-    local date, image_path = todayInfo()
-    local cached = loadCache(date)
-    if validPNG(image_path) and not force_render
+    local dir = SAVE_DIR
+    util.makePath(dir)
+    local date = todayDate()
+    local image_path = dir .. date .. ".png"
+    local cached = loadCache(dir, date)
+    local valid_image = Wallpaper.isValidPNG(image_path)
+    if valid_image and not force_render
         and (not cached or cached.layout_version == Wallpaper.VERSION) then
-        notify(_("今日一言壁纸已存在"))
+        local published = publishWallpaper(dir, image_path)
+        if published and autoScreensaverEnabled() then configureScreensaver(dir) end
+        notify(published and _("今日一言壁纸已存在") or _("图片已生成，但未能更新屏保文件"))
         return
     end
     -- Rebuilding from a cached sentence never opens a network connection, even
     -- if today's image is missing or the template changed since it was saved.
-    if cached then self:_renderCache(cached, image_path, show_message); return end
-    if validPNG(image_path) then
+    if cached then self:_renderCache(dir, cached, image_path, show_message); return end
+    if valid_image then
         notify(_("今日图片来自旧版，未缓存句子；保留原图，明天自动使用新模板"))
         return
     end
     if cache_only then notify(_("暂无今日句子缓存")); return end
     if G_reader_settings:readSetting(SETTING_LAST_ATTEMPT) == date
-        or fileExists(SAVE_DIR .. date .. ".attempt") then
+        or fileExists(dir .. date .. ".attempt") then
         notify(_("今天已请求过一言，明天再试"))
         return
     end
@@ -367,30 +404,30 @@ function Yiyan:refreshDaily(show_message, force_render, cache_only)
 
     -- Persist the attempt before starting the child. If storage is unwritable,
     -- do not send a request that the next startup might accidentally repeat.
-    if not writeAtomic(SAVE_DIR .. date .. ".attempt", date .. "\n") then
+    if not writeAtomic(dir .. date .. ".attempt", date .. "\n") then
         notify(_("无法保存请求记录，请检查存储空间和目录权限"))
         return
     end
     G_reader_settings:saveSetting(SETTING_LAST_ATTEMPT, date)
     G_reader_settings:flush()
     self._busy = true
-    self:requestSentence(date, function(payload, err)
+    self:requestSentence(dir, date, function(payload, err)
         self._busy = false
         if not payload then
             logger.warn("Yiyan: daily request failed", tostring(err))
             notify(_("今日一言请求失败；为避免重复请求，明天再试"))
             return
         end
-        local record = { date = date, payload = { hitokoto = payload.hitokoto,
+        local record = { date = date, owner = "yiyan.koplugin", payload = { hitokoto = payload.hitokoto,
             from = type(payload.from) == "string" and payload.from or "",
             from_who = type(payload.from_who) == "string" and payload.from_who or "",
             uuid = type(payload.uuid) == "string" and payload.uuid or nil } }
-        if not saveCache(record) then
+        if not saveCache(dir, record) then
             notify(_("句子已返回，但缓存保存失败；请检查存储空间"))
             return
         end
-        local current_date = todayInfo()
-        if current_date == date then self:_renderCache(record, image_path, show_message) end
+        local current_date = todayDate()
+        if current_date == date then self:_renderCache(dir, record, image_path, show_message) end
     end)
 end
 
@@ -407,25 +444,60 @@ function Yiyan:chooseOutputDirectory()
         buttons = {{
             { text = _("取消"), id = "close", callback = function() UIManager:close(dialog) end },
             { text = _("保存"), callback = function()
+                if self._busy or active_worker then
+                    UIManager:show(InfoMessage:new{ text = _("请等待当前任务完成后再修改目录") })
+                    return
+                end
                 local path = dialog:getInputText()
-                if path and path:match("^/mnt/us/") then
-                    local date, old_image = todayInfo()
-                    SAVE_DIR = path:gsub("/*$", "") .. "/"
-                    G_reader_settings:saveSetting(SETTING_SAVE_DIR, SAVE_DIR)
-                    G_reader_settings:flush()
-                    util.makePath(SAVE_DIR)
-                    local new_image = SAVE_DIR .. date .. ".png"
-                    if old_image ~= new_image and fileExists(old_image) and not fileExists(new_image) then
-                        ffiutil.copyFile(old_image, new_image)
+                if not path or not path:match("^/mnt/us/") then
+                    UIManager:show(InfoMessage:new{ text = _("请输入 /mnt/us/ 下的目录") })
+                    return
+                end
+                local dir = path:gsub("/+", "/"):gsub("/$", "") .. "/"
+                if dir:find("/../", 1, true) or dir:find("/./", 1, true) then
+                    UIManager:show(InfoMessage:new{ text = _("目录路径不能包含 . 或 ..") })
+                    return
+                end
+                local old_dir = SAVE_DIR
+                if dir ~= old_dir then
+                    if not util.makePath(dir) then
+                        UIManager:show(InfoMessage:new{ text = _("无法创建目录，请检查存储空间和目录权限") })
+                        return
                     end
-                    local old_dir = old_image:match("^(.*)/[^/]+$") .. "/"
-                    if old_dir ~= SAVE_DIR then
-                        for _, suffix in ipairs({ ".json", ".attempt" }) do
-                            local data = readFile(old_dir .. date .. suffix)
-                            if data then writeAtomic(SAVE_DIR .. date .. suffix, data) end
+                    local date = todayDate()
+                    local copies = {}
+                    for _, suffix in ipairs({ ".png", ".json", ".attempt" }) do
+                        local name = date .. suffix
+                        local data = readFile(old_dir .. name)
+                        local existing = readFile(dir .. name)
+                        if data and existing and data ~= existing then
+                            UIManager:show(InfoMessage:new{ text = _("新目录已有不同的今日壁纸数据，请选择其他目录") })
+                            return
+                        end
+                        if data and not existing then
+                            copies[#copies + 1] = { path = dir .. name, data = data }
                         end
                     end
-                    if autoScreensaverEnabled() then configureScreensaver() end
+                    for i, copy in ipairs(copies) do
+                        if not writeAtomic(copy.path, copy.data) then
+                            for j = 1, i - 1 do os.remove(copies[j].path) end
+                            UIManager:show(InfoMessage:new{ text = _("无法复制今日壁纸数据，请检查目录权限和存储空间") })
+                            return
+                        end
+                    end
+                    local image_path = dir .. date .. ".png"
+                    if not Wallpaper.isValidPNG(image_path) then
+                        image_path = screensaverDir(old_dir) .. "wallpaper.png"
+                    end
+                    if Wallpaper.isValidPNG(image_path) and not publishWallpaper(dir, image_path) then
+                        for _, copy in ipairs(copies) do os.remove(copy.path) end
+                        UIManager:show(InfoMessage:new{ text = _("无法更新新目录的屏保文件") })
+                        return
+                    end
+                    SAVE_DIR = dir
+                    G_reader_settings:saveSetting(SETTING_SAVE_DIR, dir)
+                    G_reader_settings:flush()
+                    if autoScreensaverEnabled() then configureScreensaver(dir) end
                 end
                 UIManager:close(dialog)
             end },
@@ -448,9 +520,11 @@ function Yiyan:addToMainMenu(menu_items)
                         restoreScreensaver(true)
                         UIManager:show(InfoMessage:new{ text = _("已关闭自动配置，原屏保设置已恢复") })
                     else
-                        configureScreensaver()
                         setAutoScreensaver(true)
-                        UIManager:show(InfoMessage:new{ text = _("已启用自动配置 KOReader 屏保") })
+                        local ready = configureScreensaver(SAVE_DIR)
+                        local message = ready and _("已启用自动配置 KOReader 屏保")
+                            or _("已开启自动配置，壁纸就绪后将自动切换屏保")
+                        UIManager:show(InfoMessage:new{ text = message })
                     end
                 end,
             },
