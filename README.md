@@ -2,17 +2,32 @@
 
 为 Kindle 上的 KOReader 每天获取一句[一言](https://developer.hitokoto.cn/sentence/)，生成设备分辨率的灰度 PNG，并可自动把 KOReader 睡眠屏保切换为这张壁纸。
 
-当前版本 **1.3.2** 提供三种封面。原版半露 CD 为默认样式，也可选白底日期卡或纯色深灰卡。
+**v1.3.2** · [下载 Kindle 安装包](https://github.com/iamzhangjinpeng/yiyan.koplugin/releases/download/v1.3.2/yiyan.koplugin-v1.3.2-install.zip) · [更新说明](https://github.com/iamzhangjinpeng/yiyan.koplugin/releases/tag/v1.3.2)
+
+## 主要功能
+
+- **每日一言**。按北京时间更新，联网后在后台取句。当天成功取到一句后停止自动请求，更新失败时保留上次壁纸。
+- **三种封面**。默认使用原版半露 CD，也可切换白底日期卡和纯色深灰卡。有当天缓存时可直接重绘。
+- **手动换句**。可选句子分类，手动重新生成时可以联网再取一句。
+- **屏保和诊断**。可自动配置 KOReader 睡眠屏保，也可查看网络状态、今日壁纸和重试等待时间。
+
+## 效果预览
+
+白底日期卡和纯色深灰卡按 Kindle Paperwhite 4 的 1072 × 1448 竖屏尺寸预览。图片使用示例句子，实机字体可能略有不同。
+
+| 原版半露 CD（默认） | 白底日期卡 | 纯色深灰卡 |
+| --- | --- | --- |
+| ![原版半露 CD](docs/demo.png) | ![白底日期卡](docs/date-card-demo.png) | ![纯色深灰卡](docs/dark-card-demo.png) |
 
 ## 安装
 
-把整个 `yiyan.koplugin` 目录复制到：
+完全退出 KOReader，解压安装包，然后把整个 `yiyan.koplugin` 文件夹复制到下列位置。已有旧版时可直接覆盖。
 
 ```text
 /mnt/us/koreader/plugins/yiyan.koplugin/
 ```
 
-完全退出并重启 KOReader。插件启动后会延迟几秒检查当天壁纸；联网请求在后台执行，不会卡住阅读界面。
+复制完成后重启 KOReader。插件会在启动后延迟几秒检查当天壁纸，联网请求在后台执行。
 
 请复制整个文件夹，保留 `main.lua`、`wallpaper.lua`、`_meta.lua` 和完整的 `assets/` 目录。壁纸按设备的竖屏尺寸生成，并使用 16 级灰度抖动导出 PNG。
 
@@ -90,14 +105,6 @@ yiyan_rate_limited_until
 ```
 
 若在插件管理器里停用过一言，还可删除 `plugins_disabled` 表中单独的 `yiyan` 条目。若同目录存在 `settings.reader.lua.old`，可用相同方法清理其中的一言条目，保留其余设置。
-
-## 效果预览
-
-下图使用示例句子。Kindle 上的字体可能略有不同。
-
-| 原版半露 CD | 白底日期卡 | 纯色深灰卡 |
-| --- | --- | --- |
-| ![原版半露 CD](docs/demo.png) | ![白底日期卡](docs/date-card-demo.png) | ![纯色深灰卡](docs/dark-card-demo.png) |
 
 ## 参考
 
