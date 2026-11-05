@@ -76,18 +76,24 @@ bb.COLOR_GRAY_4, bb.COLOR_GRAY_6, bb.COLOR_GRAY_B = "gray4", "gray6", "grayB"
 local text = {}
 function text:new(t)
     f.live_widgets = f.live_widgets + 1
-    function t:getSize()
-        local rows = 0
-        for line in (self.text .. "\n"):gmatch("(.-)\n") do
-            local chars = 0
-            for i = 1, #line do
-                local b = line:byte(i)
-                if b < 128 or b >= 192 then chars = chars + 1 end
-            end
-            rows = rows + math.max(1, math.ceil(chars * self.face.size / self.width))
+    local rows = 0
+    for line in (t.text .. "\n"):gmatch("(.-)\n") do
+        local chars = 0
+        for i = 1, #line do
+            local b = line:byte(i)
+            if b < 128 or b >= 192 then chars = chars + 1 end
         end
-        return { w = self.width, h = self.height or math.ceil(rows * self.face.size * (1 + self.line_height)) }
+        rows = rows + math.max(1, math.ceil(chars * t.face.size / t.width))
     end
+    local line_height = math.floor(t.face.size * (1 + t.line_height) + 0.5)
+    local height = rows * line_height
+    if t.height then
+        local page = math.max(1, math.floor(t.height / line_height))
+        if t.height_overflow_show_ellipsis and rows > page then t.line_with_ellipsis = page end
+        height = t.height_adjust and math.min(rows, page) * line_height or math.max(t.height, line_height)
+    end
+    f.max_text_buffer_pixels = math.max(f.max_text_buffer_pixels or 0, t.width * height)
+    function t:getSize() return { w = self.width, h = height } end
     function t:paintTo(_, x, y)
         assert(self:getSize().h > 0)
         table.insert(f.paints, { x = x, y = y, w = self.width, h = self:getSize().h,
@@ -267,7 +273,7 @@ class PluginTests(unittest.TestCase):
         self.refresh()
         self.assertEqual(self.f.request_url, "https://v1.hitokoto.cn/?encode=json&charset=utf-8")
         self.assertTrue((self.path / (self.date + ".png")).exists())
-        self.assertEqual(json.loads((self.path / (self.date + ".json")).read_text())["layout_version"], 6)
+        self.assertEqual(json.loads((self.path / (self.date + ".json")).read_text())["layout_version"], 7)
         self.f.settings.data = self.lua.table()
         self.refresh()
         self.assertEqual(self.f.requests, 1)
@@ -346,6 +352,19 @@ class PluginTests(unittest.TestCase):
         self.assertEqual(cache.with_suffix(".png").read_bytes(), PNG)
         self.assertEqual(self.f.background, "dark-card-background.png")
         self.assertEqual(self.f.requests, 1)
+
+    def test_calendar_normalizes_line_endings_and_bounds_long_text_buffers(self):
+        self.f.screen_width, self.f.screen_height = 1072, 1448
+        quote = "第一行\r\n第二行\r第三行\n" + "下一行\n" * 600
+        self.f.raw_response = json.dumps({**self.payload, "hitokoto": quote}, ensure_ascii=False)
+        self.cover_menu()[2].callback()
+        self.refresh()
+        rendered = next(p.text for _, p in self.f.paints.items() if p.text.startswith("第一行"))
+        self.assertTrue(rendered.startswith("第一行\n第二行\n第三行\n"))
+        self.assertNotIn("\r", rendered)
+        self.assertLessEqual(self.f.max_text_buffer_pixels, 1072 * 300)
+        self.assertTrue((self.path / (self.date + ".png")).exists())
+        self.assertEqual(self.f.live_widgets, 0)
 
     def test_manual_menu_requests_another_sentence_and_keeps_wallpaper_on_failure(self):
         self.refresh()
@@ -1286,7 +1305,7 @@ class PluginTests(unittest.TestCase):
                 self.assertEqual(archive.read_bytes(), new_png)
                 self.assertEqual(display.read_bytes(), new_png)
                 recovered = json.loads(cache.read_text())
-                self.assertEqual(recovered["layout_version"], 6)
+                self.assertEqual(recovered["layout_version"], 7)
                 self.assertEqual(recovered["image_digest"], new_png.hex())
                 self.assertNotIn("pending_image", recovered)
                 self.assertEqual(self.f.renders - previous_renders, 0 if failure == "final_cache" else 1)

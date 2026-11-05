@@ -8,7 +8,7 @@ local Font = require("ui/font")
 local Screen = require("device").screen
 local logger = require("logger")
 
-local Wallpaper = { VERSION = 6, DEFAULT_STYLE = "classic" }
+local Wallpaper = { VERSION = 7, DEFAULT_STYLE = "classic" }
 local BACKGROUNDS = {
     classic = "lyrics-background.png",
     calendar = "date-card-background.png",
@@ -144,8 +144,12 @@ local LINE_BREAK_SUFFIX = {
     ["!"] = true, ["?"] = true, ["…"] = true,
 }
 
+local function quoteText(payload)
+    return (payload.hitokoto:gsub("\r\n", "\n"):gsub("\r", "\n"):gsub("\n+$", ""))
+end
+
 function Wallpaper.body(payload)
-    local text = payload.hitokoto:gsub("\r\n", "\n"):gsub("\r", "\n")
+    local text = quoteText(payload)
     local parts, break_pending = {}, false
     -- Match one UTF-8 character and keep punctuation clusters together.
     for char in text:gmatch(".[\128-\191]*") do
@@ -156,7 +160,7 @@ function Wallpaper.body(payload)
         parts[#parts + 1] = char
         if LINE_BREAK[char] then break_pending = true end
     end
-    return (table.concat(parts):gsub("\n+$", ""))
+    return table.concat(parts)
 end
 
 local function textInBox(text, box, fgcolor, bgcolor, default_line_height)
@@ -169,14 +173,19 @@ local function textInBox(text, box, fgcolor, bgcolor, default_line_height)
         local widget = TextBoxWidget:new{
             text = text, face = Font:getFace("cfont", math.max(1, round(size / screen_scale))),
             width = box.width, bold = box.bold,
-            height = at_minimum and box.height or nil,
-            height_overflow_show_ellipsis = at_minimum,
+            -- KOReader allocates a pixel buffer during construction. Bound it
+            -- on every size trial, even when the quote has many line breaks.
+            height = box.height,
+            height_adjust = true,
+            height_overflow_show_ellipsis = true,
             alignment = box.alignment or "left", alignment_strict = true, auto_para_direction = true,
             line_height = box.line_height or default_line_height,
             fgcolor = box.fgcolor or fgcolor,
             bgcolor = bgcolor,
         }
-        if at_minimum or widget:getSize().h <= box.height then return widget end
+        if at_minimum or (not widget.line_with_ellipsis and widget:getSize().h <= box.height) then
+            return widget
+        end
         widget:free()
         size = math.max(box.min_size, size - 2)
     end
@@ -229,7 +238,7 @@ function Wallpaper.render(plugin_path, payload, date, target, width, height, sty
                 cardText(MONTHS[month], layout.month)
                 cardText(day, layout.day)
                 cardText("星期" .. WEEKDAYS[weekday], layout.weekday)
-                cardText(payload.hitokoto, layout.body)
+                cardText(quoteText(payload), layout.body)
                 cardText("来自一言", layout.attribution)
             end
             cardText(title, layout.source)

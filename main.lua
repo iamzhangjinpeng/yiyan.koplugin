@@ -545,7 +545,7 @@ function Yiyan:requestSentence(date, response_path, work_dir, replacement, callb
             local request_ok, code = http.request{
                 url = url,
                 method = "GET",
-                headers = { ["User-Agent"] = "KOReader-yiyan.koplugin/1.3.0" },
+                headers = { ["User-Agent"] = "KOReader-yiyan.koplugin/1.3.1" },
                 redirect = false,
                 sink = function(chunk, sink_err)
                     if sink_err then return nil, sink_err end
