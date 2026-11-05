@@ -37,6 +37,7 @@ local SETTING_ATTEMPT_HISTORY = "yiyan_attempt_history"
 local SETTING_RATE_LIMIT = "yiyan_rate_limited_until"
 local SETTING_SAVE_DIR = "yiyan_save_dir"
 local SETTING_CATEGORIES = "yiyan_categories"
+local SETTING_COVER_STYLE = "yiyan_cover_style"
 local CACHE_OWNER = "yiyan.koplugin"
 local CATEGORIES = {
     { "a", _("动画") }, { "b", _("漫画") }, { "c", _("游戏") },
@@ -44,6 +45,15 @@ local CATEGORIES = {
     { "g", _("其他") }, { "h", _("影视") }, { "i", _("诗词") },
     { "j", _("网易云") }, { "k", _("哲学") }, { "l", _("抖机灵") },
 }
+local COVER_STYLES = {
+    { Wallpaper.DEFAULT_STYLE, _("原版半露 CD（默认）") },
+    { "calendar", _("白底日期卡") },
+    { "dark", _("纯色深灰卡") },
+}
+
+local function selectedCoverStyle()
+    return Wallpaper.coverStyle(G_reader_settings:readSetting(SETTING_COVER_STYLE))
+end
 
 local active_worker
 local active_instance
@@ -535,7 +545,7 @@ function Yiyan:requestSentence(date, response_path, work_dir, replacement, callb
             local request_ok, code = http.request{
                 url = url,
                 method = "GET",
-                headers = { ["User-Agent"] = "KOReader-yiyan.koplugin/1.2.9" },
+                headers = { ["User-Agent"] = "KOReader-yiyan.koplugin/1.3.0" },
                 redirect = false,
                 sink = function(chunk, sink_err)
                     if sink_err then return nil, sink_err end
@@ -637,10 +647,10 @@ function Yiyan:requestSentence(date, response_path, work_dir, replacement, callb
     UIManager:scheduleIn(POLL_INTERVAL, poll)
 end
 
-function Yiyan:renderImage(payload, date, target)
+function Yiyan:renderImage(payload, date, target, style)
     local width, height = Device.screen:getWidth(), Device.screen:getHeight()
     return Wallpaper.render(self.path or plugin_dir:gsub("/$", ""), payload, date, target,
-        math.min(width, height), math.max(width, height))
+        math.min(width, height), math.max(width, height), style)
 end
 
 function Yiyan:_renderCache(dir, cached, image_path, show_message)
@@ -653,9 +663,15 @@ function Yiyan:_renderCache(dir, cached, image_path, show_message)
     local mode = lfs.symlinkattributes(image_path, "mode")
     local current = mode == "file" and readFile(image_path)
     local digest = current and md5(current)
+    local style = selectedCoverStyle()
     local pending = cached.pending_image
     local recovered = digest and type(pending) == "table" and digest == pending.digest
         and type(pending.layout_version) == "number" and Wallpaper.isValidPNG(image_path)
+    if recovered and not Wallpaper.hasCurrentLayout(pending, style) then
+        -- The interrupted render owns this PNG, even when another style is now selected.
+        cached.image_digest = pending.digest
+        recovered = false
+    end
     if not recovered then
         local legacy = not cached.owner and (cached.layout_version == 1 or cached.layout_version == 2)
         if mode and (not digest or (digest ~= cached.image_digest and not legacy)) then
@@ -667,7 +683,7 @@ function Yiyan:_renderCache(dir, cached, image_path, show_message)
             notify(_("无法创建图片临时文件，请检查存储空间和目录权限"))
             return false
         end
-        local rendered = self:renderImage(cached.payload, cached.date, tmp) and readFile(tmp)
+        local rendered = self:renderImage(cached.payload, cached.date, tmp, style) and readFile(tmp)
         if not rendered then
             discardStage(tmp, work_dir)
             notify(_("图片生成失败，句子已缓存，下次检查时会重试"))
@@ -676,7 +692,7 @@ function Yiyan:_renderCache(dir, cached, image_path, show_message)
 
         -- Record both digests before replacing the archive. After an interrupted
         -- update, either the previous image or the staged one can be identified.
-        pending = { digest = md5(rendered), layout_version = Wallpaper.VERSION }
+        pending = { digest = md5(rendered), layout_version = Wallpaper.VERSION, cover_style = style }
         cached.pending_image = pending
         local replaced = saveCache(dir, cached) and os.rename(tmp, image_path)
         discardStage(tmp, work_dir)
@@ -687,6 +703,7 @@ function Yiyan:_renderCache(dir, cached, image_path, show_message)
     end
 
     cached.layout_version = pending.layout_version
+    cached.cover_style = pending.cover_style or Wallpaper.DEFAULT_STYLE
     cached.owner = CACHE_OWNER
     cached.image_digest = pending.digest
     cached.pending_image = nil
@@ -732,7 +749,7 @@ function Yiyan:cleanupOldImages(dir, keep_date)
     end
 end
 
-function Yiyan:refreshDaily(show_message, fetch_new)
+function Yiyan:refreshDaily(show_message, fetch_new, local_only)
     if self._stopped then return end
     local function notify(message)
         if show_message and not self._stopped then UIManager:show(InfoMessage:new{ text = message }) end
@@ -776,9 +793,13 @@ function Yiyan:refreshDaily(show_message, fetch_new)
         notify(_("同名 JSON 无法识别为一言缓存，请移走后再生成"))
         return
     end
+    if local_only and not cached then
+        notify(_("封面类型已保存，取得句子后将使用新样式"))
+        return
+    end
     if cached then rememberSuccess(dir, date) end
     if not fetch_new and Wallpaper.isValidPNG(image_path)
-        and (not cached or (not cached.pending_image and cached.layout_version == Wallpaper.VERSION)) then
+        and (not cached or (not cached.pending_image and Wallpaper.hasCurrentLayout(cached, selectedCoverStyle()))) then
         if not matchesArchivedImage(image_path, cached) then
             notify(_("同名图片无法确认归属，请移走后再重新生成"))
             return
@@ -936,7 +957,7 @@ function Yiyan:networkDiagnostics()
     if cached and cached.pending_image then
         wallpaper = _("等待完成更新")
     elseif usable_image then
-        wallpaper = (cached and cached.layout_version ~= Wallpaper.VERSION) and _("等待重新生成")
+        wallpaper = (cached and not Wallpaper.hasCurrentLayout(cached, selectedCoverStyle())) and _("等待重新生成")
             or _("已就绪")
     elseif image_exists then
         wallpaper = _("文件无法使用")
@@ -1132,6 +1153,21 @@ function Yiyan:addToMainMenu(menu_items)
             end,
         }
     end
+    local covers = {}
+    for _, cover in ipairs(COVER_STYLES) do
+        local style, label = cover[1], cover[2]
+        covers[#covers + 1] = {
+            text = label,
+            checked_func = function() return selectedCoverStyle() == style end,
+            callback = function()
+                if G_reader_settings:readSetting(SETTING_COVER_STYLE) ~= style then
+                    G_reader_settings:saveSetting(SETTING_COVER_STYLE, style)
+                    G_reader_settings:flush()
+                end
+                self:refreshDaily(true, false, true)
+            end,
+        }
+    end
     menu_items.yiyan = {
         text = _("一言壁纸"),
         sorting_hint = "tools",
@@ -1155,6 +1191,7 @@ function Yiyan:addToMainMenu(menu_items)
                 end,
             },
             { text = _("句子类型（下次请求生效）"), sub_item_table = categories },
+            { text = _("封面类型"), sub_item_table = covers },
             { text = _("重新生成今日壁纸"), callback = function() self:refreshDaily(true, true) end },
             { text = _("网络诊断"), callback = function()
                 UIManager:show(InfoMessage:new{ text = self:networkDiagnostics() })

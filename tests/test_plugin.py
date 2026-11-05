@@ -72,6 +72,7 @@ function bb.new(w, h)
     return image
 end
 bb.TYPE_BB8, bb.COLOR_BLACK, bb.COLOR_WHITE = 1, "black", "white"
+bb.COLOR_GRAY_4, bb.COLOR_GRAY_6, bb.COLOR_GRAY_B = "gray4", "gray6", "grayB"
 local text = {}
 function text:new(t)
     f.live_widgets = f.live_widgets + 1
@@ -151,9 +152,15 @@ local modules = {
     end },
     ["ui/renderimage"] = {
         renderImageFile = function(_, path)
-            assert(path == test_root .. "/assets/lyrics-background.png")
+            local name = path:match("/([^/]+)$")
+            assert(path == test_root .. "/assets/" .. name)
+            local classic = name == "lyrics-background.png"
+            assert(classic or name == "date-card-background.png" or name == "dark-card-background.png")
+            local file = assert(io.open(path, "rb"))
+            file:close()
+            f.background = name
             if f.missing_background then return nil end
-            return bb.new(758, 1024)
+            return classic and bb.new(758, 1024) or bb.new(1072, 1448)
         end,
         scaleBlitBuffer = function(_, image, w, h) image:free(); return bb.new(w, h) end,
     },
@@ -265,6 +272,80 @@ class PluginTests(unittest.TestCase):
         self.refresh()
         self.assertEqual(self.f.requests, 1)
         self.assertEqual(self.f.live_widgets, 0)
+
+    def cover_menu(self):
+        menu = self.lua.table()
+        self.obj.addToMainMenu(self.obj, menu)
+        return next(item.sub_item_table for _, item in menu.yiyan.sub_item_table.items()
+                    if item.text == "封面类型")
+
+    def test_cover_menu_switches_and_persists_styles_without_refetching(self):
+        self.f.screen_width, self.f.screen_height = 1072, 1448
+        covers = self.cover_menu()
+        self.assertEqual([covers[i].text for i in range(1, len(covers) + 1)],
+                         ["原版半露 CD（默认）", "白底日期卡", "纯色深灰卡"])
+        self.assertTrue(covers[1].checked_func())
+        covers[2].callback()
+        self.assertEqual(self.f.requests, 0)
+        self.assertIn("封面类型已保存", self.f.message)
+
+        self.refresh()
+        cache = self.path / (self.date + ".json")
+        self.assertEqual(self.f.background, "date-card-background.png")
+        self.assertEqual((self.f.export_width, self.f.export_height), (1072, 1448))
+        self.assertEqual(json.loads(cache.read_text())["cover_style"], "calendar")
+        self.assertTrue({"Nov.", "04", "星期三"} <= {p.text for _, p in self.f.paints.items()})
+
+        self.f.paints = self.lua.table()
+        self.f.connected = False
+        covers[3].callback()
+        self.assertEqual(self.f.background, "dark-card-background.png")
+        self.assertEqual(json.loads(cache.read_text())["cover_style"], "dark")
+        self.assertEqual(self.f.settings.data.yiyan_cover_style, "dark")
+        self.assertIn("11.04  /  WED", {p.text for _, p in self.f.paints.items()})
+        self.assertTrue(all(p.bg == "gray4" for _, p in self.f.paints.items()))
+
+        self.lua.execute("plugin = loadPlugin(); obj = newPlugin()")
+        self.obj = self.lua.globals().obj
+        covers = self.cover_menu()
+        self.assertTrue(covers[3].checked_func())
+        covers[1].callback()
+        self.assertEqual(self.f.background, "lyrics-background.png")
+        self.assertEqual(json.loads(cache.read_text())["payload"]["hitokoto"], self.payload["hitokoto"])
+        self.assertEqual(self.f.requests, 1)
+        self.assertEqual(self.f.live_widgets, 0)
+
+    def test_switching_style_recovers_an_interrupted_render_for_another_style(self):
+        self.refresh()
+        cache = self.path / (self.date + ".json")
+        new_png = (ROOT / "docs/demo.png").read_bytes()
+        self.lua.globals().alternate_test_png = new_png
+        self.f.invalid_png = new_png
+        self.lua.execute(r'''
+            local rename = os.rename
+            os.rename = function(src, dst)
+                if f.fail_cache and dst:match("%d+%.json$") then
+                    f.cache_renames = (f.cache_renames or 0) + 1
+                    if f.cache_renames == 2 then return nil, "disk full" end
+                end
+                return rename(src, dst)
+            end
+        ''')
+        covers = self.cover_menu()
+        self.f.fail_cache = True
+        covers[2].callback()
+        self.assertEqual(json.loads(cache.read_text())["pending_image"]["cover_style"], "calendar")
+        self.assertEqual(cache.with_suffix(".png").read_bytes(), new_png)
+        self.assertEqual((self.path / ".yiyan-screen/wallpaper.png").read_bytes(), PNG)
+
+        self.f.fail_cache, self.f.invalid_png = False, None
+        covers[3].callback()
+        record = json.loads(cache.read_text())
+        self.assertEqual(record["cover_style"], "dark")
+        self.assertNotIn("pending_image", record)
+        self.assertEqual(cache.with_suffix(".png").read_bytes(), PNG)
+        self.assertEqual(self.f.background, "dark-card-background.png")
+        self.assertEqual(self.f.requests, 1)
 
     def test_manual_menu_requests_another_sentence_and_keeps_wallpaper_on_failure(self):
         self.refresh()

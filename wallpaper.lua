@@ -1,5 +1,4 @@
--- White lyric-poster layout. All measurements are physical pixels, scaled from
--- the bundled 758x1024 template; text never overlaps the corner illustration.
+-- Layout measurements are physical pixels, scaled from each bundled template.
 local Blitbuffer = require("ffi/blitbuffer")
 local ffi = require("ffi")
 local Png = require("ffi/png")
@@ -9,7 +8,21 @@ local Font = require("ui/font")
 local Screen = require("device").screen
 local logger = require("logger")
 
-local Wallpaper = { VERSION = 6 }
+local Wallpaper = { VERSION = 6, DEFAULT_STYLE = "classic" }
+local BACKGROUNDS = {
+    classic = "lyrics-background.png",
+    calendar = "date-card-background.png",
+    dark = "dark-card-background.png",
+}
+
+function Wallpaper.coverStyle(style)
+    return BACKGROUNDS[style] and style or Wallpaper.DEFAULT_STYLE
+end
+
+function Wallpaper.hasCurrentLayout(record, style)
+    return record.layout_version == Wallpaper.VERSION
+        and (record.cover_style or Wallpaper.DEFAULT_STYLE) == style
+end
 
 function Wallpaper.isValidPNG(path)
     local file = io.open(path, "rb")
@@ -56,6 +69,45 @@ function Wallpaper.layout(width, height)
             font_size = math.max(11, round(13 * scale)), min_size = math.max(10, round(11 * scale)),
             alignment = "center" },
     }
+end
+
+-- The date and dark card backgrounds were composed at the KPW4 resolution.
+local function cardLayout(width, height, dark)
+    local sx, sy = width / 1072, height / 1448
+    local scale = math.min(sx, sy)
+    local function box(x, y, w, h, size, min_size, line_height, bold, fgcolor)
+        return {
+            x = round(x * sx), y = round(y * sy), width = round(w * sx), height = round(h * sy),
+            font_size = math.max(1, round(size * scale)), min_size = math.max(1, round(min_size * scale)),
+            line_height = line_height, bold = bold, fgcolor = fgcolor,
+        }
+    end
+    local muted = dark and Blitbuffer.COLOR_GRAY_B or Blitbuffer.COLOR_GRAY_6
+    return {
+        month = not dark and box(149, 210, 235, 145, 108, 76, 0.04, true) or nil,
+        day = not dark and box(391, 221, 70, 62, 47, 30, 0.1, true) or nil,
+        weekday = not dark and box(464, 229, 181, 58, 32, 24, 0.15, true) or nil,
+        header = dark and box(147, 204, 510, 58, 31, 24, 0.16, true) or nil,
+        body = dark and box(149, 631, 773, 407, 51, 29, 0.74)
+            or box(149, 465, 773, 277, 48, 28, 0.60),
+        attribution = not dark and box(150, 759, 770, 52, 29, 22, 0.2, nil, muted) or nil,
+        source = box(dark and 296 or 287, 1120, 555, 56, 39, 24, 0.12, true),
+        author = box(dark and 297 or 288, 1181, 554, 49, 28, 21, 0.17, nil, muted),
+    }
+end
+
+local MONTHS = { "Jan.", "Feb.", "Mar.", "Apr.", "May", "Jun.", "Jul.", "Aug.", "Sep.", "Oct.", "Nov.", "Dec." }
+local WEEKDAYS = { "日", "一", "二", "三", "四", "五", "六" }
+local WEEKDAYS_EN = { "SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT" }
+local WEEKDAY_OFFSETS = { 0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4 }
+
+local function cardDate(date)
+    local year, month, day = tonumber(date:sub(1, 4)), tonumber(date:sub(5, 6)), tonumber(date:sub(7, 8))
+    -- Gregorian weekday from the archived date, independent of device time zone.
+    if month < 3 then year = year - 1 end
+    local weekday = (year + math.floor(year / 4) - math.floor(year / 100)
+        + math.floor(year / 400) + WEEKDAY_OFFSETS[month] + day) % 7 + 1
+    return month, weekday
 end
 
 local function field(value)
@@ -107,7 +159,7 @@ function Wallpaper.body(payload)
     return (table.concat(parts):gsub("\n+$", ""))
 end
 
-local function textInBox(text, box, is_footer)
+local function textInBox(text, box, fgcolor, bgcolor, default_line_height)
     local size = box.font_size
     -- Layout sizes are already in pixels. Font:getFace scales its input
     -- again, so convert the intended pixel size back to a UI font size.
@@ -120,9 +172,9 @@ local function textInBox(text, box, is_footer)
             height = at_minimum and box.height or nil,
             height_overflow_show_ellipsis = at_minimum,
             alignment = box.alignment or "left", alignment_strict = true, auto_para_direction = true,
-            line_height = is_footer and 0.25 or 0.65,
-            fgcolor = is_footer and Blitbuffer.COLOR_WHITE or Blitbuffer.COLOR_BLACK,
-            bgcolor = is_footer and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_WHITE,
+            line_height = box.line_height or default_line_height,
+            fgcolor = box.fgcolor or fgcolor,
+            bgcolor = bgcolor,
         }
         if at_minimum or widget:getSize().h <= box.height then return widget end
         widget:free()
@@ -131,12 +183,13 @@ local function textInBox(text, box, is_footer)
 end
 
 -- The caller provides a private staging path and publishes the validated PNG.
-function Wallpaper.render(plugin_path, payload, date, target, width, height)
+function Wallpaper.render(plugin_path, payload, date, target, width, height, style)
     local image, background, eink
     local widgets = {}
+    style = Wallpaper.coverStyle(style)
     local ok, result = pcall(function()
-        local layout = Wallpaper.layout(width, height)
-        background = RenderImage:renderImageFile(plugin_path .. "/assets/lyrics-background.png", false)
+        local black, white = Blitbuffer.COLOR_BLACK, Blitbuffer.COLOR_WHITE
+        background = RenderImage:renderImageFile(plugin_path .. "/assets/" .. BACKGROUNDS[style], false)
         assert(background, "Cannot load the bundled wallpaper background")
         background = RenderImage:scaleBlitBuffer(background, width, height)
         assert(background, "Cannot scale the wallpaper background")
@@ -144,20 +197,44 @@ function Wallpaper.render(plugin_path, payload, date, target, width, height)
         image:blitFrom(background, 0, 0, 0, 0, width, height)
         background:free()
         background = nil
-        -- Paint a precise black band after scaling so footer glyphs have a
-        -- uniform background at every Kindle resolution.
-        image:paintRect(0, layout.footer.y, width, layout.footer.height, Blitbuffer.COLOR_BLACK)
-        paintDisc(image, layout.disc)
-        local function paint(text, box, footer)
-            local widget = textInBox(text, box, footer)
+        local function paint(text, box, fgcolor, bgcolor, line_height)
+            local widget = textInBox(text, box, fgcolor, bgcolor, line_height)
             widgets[#widgets + 1] = widget
             widget:paintTo(image, box.x, box.y)
         end
-        paint(Wallpaper.body(payload), layout.body, false)
         local title, author = Wallpaper.source(payload)
-        local formatted_date = date:sub(1, 4) .. "-" .. date:sub(5, 6) .. "-" .. date:sub(7, 8)
-        paint(title, layout.source, true)
-        paint((author or "一言") .. "  ·  " .. formatted_date, layout.date, true)
+        if style == Wallpaper.DEFAULT_STYLE then
+            local layout = Wallpaper.layout(width, height)
+            -- Paint the black band after scaling for a uniform text background.
+            image:paintRect(0, layout.footer.y, width, layout.footer.height, black)
+            paintDisc(image, layout.disc)
+            paint(Wallpaper.body(payload), layout.body, black, white, 0.65)
+            local formatted_date = date:sub(1, 4) .. "-" .. date:sub(5, 6) .. "-" .. date:sub(7, 8)
+            paint(title, layout.source, white, black, 0.25)
+            paint((author or "一言") .. "  ·  " .. formatted_date, layout.date, white, black, 0.25)
+        else
+            local dark = style == "dark"
+            local layout = cardLayout(width, height, dark)
+            local fgcolor = dark and white or black
+            local bgcolor = dark and Blitbuffer.COLOR_GRAY_4 or white
+            local function cardText(text, box)
+                paint(text, box, fgcolor, bgcolor, 0.65)
+            end
+            local month, weekday = cardDate(date)
+            local day = date:sub(7, 8)
+            if dark then
+                cardText(date:sub(5, 6) .. "." .. day .. "  /  " .. WEEKDAYS_EN[weekday], layout.header)
+                cardText(Wallpaper.body(payload), layout.body)
+            else
+                cardText(MONTHS[month], layout.month)
+                cardText(day, layout.day)
+                cardText("星期" .. WEEKDAYS[weekday], layout.weekday)
+                cardText(payload.hitokoto, layout.body)
+                cardText("来自一言", layout.attribution)
+            end
+            cardText(title, layout.source)
+            cardText(author or "一言", layout.author)
+        end
         eink = Blitbuffer.new(width, height, Blitbuffer.TYPE_BB8)
         eink:ditherblitFrom(image, 0, 0, 0, 0, width, height)
         image:free()

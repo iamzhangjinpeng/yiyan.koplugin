@@ -2,7 +2,7 @@
 
 为 Kindle 上的 KOReader 每天获取一句[一言](https://developer.hitokoto.cn/sentence/)，生成设备分辨率的灰度 PNG，并可自动把 KOReader 睡眠屏保切换为这张壁纸。
 
-当前版本 **1.2.9** 使用白色背景、左上方分行正文和右下角石头与淡水波纹。左下角的圆形 CD 一半露出黑栏。书名或歌名在 CD 右侧的空间内居中，下方小字显示作者和日期。
+当前版本 **1.3.0** 提供三种封面。原版半露 CD 为默认样式，也可选白底日期卡或纯色深灰卡。
 
 ## 安装
 
@@ -14,7 +14,7 @@
 
 完全退出并重启 KOReader。插件启动后会延迟几秒检查当天壁纸；联网请求在后台执行，不会卡住阅读界面。
 
-请复制整个文件夹，保留 `main.lua`、`wallpaper.lua`、`_meta.lua` 和 `assets/lyrics-background.png`。随附的背景图为 **758 × 1024**，生成时会缩放到设备的竖屏尺寸，并使用 16 级灰度抖动导出 PNG。
+请复制整个文件夹，保留 `main.lua`、`wallpaper.lua`、`_meta.lua` 和完整的 `assets/` 目录。壁纸按设备的竖屏尺寸生成，并使用 16 级灰度抖动导出 PNG。
 
 ## 菜单功能
 
@@ -24,6 +24,7 @@
 | --- | --- |
 | 自动配置 KOReader 屏保 | 默认开启。壁纸就绪后，自动用它作为 KOReader 的睡眠屏保。关闭时恢复仍由插件控制的屏保设置，插件仍会生成壁纸。 |
 | 句子类型（下次请求生效） | 可勾选一个或多个分类。点「默认随机」清空选择。想当天用新分类取句，可以手动重新生成今日壁纸。 |
+| 封面类型 | 在「原版半露 CD（默认）」「白底日期卡」「纯色深灰卡」之间切换。有当天句子时会直接用缓存重绘。尚未取句时会保存选择，等句子就绪后使用新样式。 |
 | 重新生成今日壁纸 | 联网再请求一句，即使当天已自动更新也可使用。开启自动配置时，新图生成后会替换屏保。失败时保留当前壁纸，手动请求也受重试间隔和限流等待约束。 |
 | 网络诊断 | 查看 Wi-Fi 状态、今日句子和壁纸是否就绪、当前会话中当天最近一次请求结果，以及剩余重试等待时间。打开诊断不会请求一言 API。 |
 | 设置屏保图片目录 | 查看或更改保存目录。默认是 `/mnt/us/koreader/screenshots/yiyan/`。可输入 `/mnt/us/` 下的路径，切换时会复制可识别的今日数据。 |
@@ -82,6 +83,7 @@ yiyan_auto_screensaver
 yiyan_screensaver_backup
 yiyan_save_dir
 yiyan_categories
+yiyan_cover_style
 yiyan_last_attempt_date
 yiyan_attempt_history
 yiyan_rate_limited_until
@@ -91,9 +93,11 @@ yiyan_rate_limited_until
 
 ## 效果预览
 
-下图采用相同版式参数和示例数据制作；Kindle 上的字体可能略有不同。
+下图使用示例句子。Kindle 上的字体可能略有不同。
 
-![一言锁屏壁纸示例](docs/demo.png)
+| 原版半露 CD | 白底日期卡 | 纯色深灰卡 |
+| --- | --- | --- |
+| ![原版半露 CD](docs/demo.png) | ![白底日期卡](docs/date-card-demo.png) | ![纯色深灰卡](docs/dark-card-demo.png) |
 
 ## 参考
 
