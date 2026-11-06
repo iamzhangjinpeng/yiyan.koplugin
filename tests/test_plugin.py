@@ -17,7 +17,8 @@ BROKEN_PNG = b"\x89PNG\r\n\x1a\n" + b"fixture" * 4 + b"\0\0\0\0IEND\xaeB`\x82"
 
 MOCKS = r'''
 f = { queue = {}, requests = 0, renders = 0, live_widgets = 0, locks = 0,
-    paints = {}, shapes = {}, now = 0, connected = true, settings = { data = {} } }
+    paints = {}, shapes = {}, now = 0, connected = true, settings = { data = {} },
+    archive_entries = {} }
 function f.settings:readSetting(k) return self.data[k] end
 function f.settings:saveSetting(k, v) self.data[k] = v end
 function f.settings:delSetting(k) self.data[k] = nil end
@@ -31,6 +32,7 @@ end
 function ui:show(message) f.message = message.text end
 function ui:preventStandby() f.locks = f.locks + 1 end
 function ui:allowStandby() f.locks = f.locks - 1 end
+function ui:restartKOReader() f.restarted = true end
 function f:drain()
     local steps = 0
     while #self.queue > 0 do
@@ -116,8 +118,10 @@ function ffi.readAllFromFD() return f.pipe end
 function ffi.isSubProcessDone() return f.done end
 function ffi.terminateSubProcess() f.done = true; f.kills = (f.kills or 0) + 1 end
 function ffi.copyFile(a, b)
+    f.copy_calls = (f.copy_calls or 0) + 1
+    if f.fail_copy_at == f.copy_calls then return false end
     local src = assert(io.open(a, "rb")); local data = src:read("*a"); src:close()
-    local out = assert(io.open(b, "wb")); out:write(data); out:close(); return true
+    local out = assert(io.open(b, "wb")); out:write(data); out:close()
 end
 local http = {}
 function http.open()
@@ -126,21 +130,59 @@ end
 function http.request(request)
     local opened, connection = pcall(http.open)
     if not opened then return nil, connection end
-    f.requests = f.requests + 1
     f.request_url = request.url
     assert(request.method == "GET")
-    assert(request.redirect == false, "a redirect must not spend another request")
+    local data, code
+    if request.url:match("^https://api%.github%.com/") then
+        f.update_checks = (f.update_checks or 0) + 1
+        assert(request.redirect == false)
+        data, code = f.update_release_body or f.raw_response, f.update_api_code or 200
+    elseif request.url:match("^https://github%.com/iamzhangjinpeng/yiyan%.koplugin/releases/download/") then
+        f.update_downloads = (f.update_downloads or 0) + 1
+        assert(request.redirect == true)
+        data, code = f.update_package_data or "package", f.update_download_code or 200
+    else
+        f.requests = f.requests + 1
+        assert(request.redirect == false, "a redirect must not spend another request")
+        data, code = f.raw_response, f.http_code or 200
+    end
     if f.http_error then return nil, "offline" end
-    local ok, err = request.sink(f.raw_response)
+    local ok, err = request.sink(data)
     connection:close()
     if not ok then return nil, err end
-    return 1, f.http_code or 200
+    return 1, code
+end
+local confirm = {}
+function confirm:new(options) f.confirm = options; return options end
+local archiver = { Reader = {} }
+function archiver.Reader:new()
+    local reader = {}
+    function reader:open(path) f.archive_path = path; return not f.archive_open_failed end
+    function reader:iterate()
+        local i = 0
+        return function()
+            i = i + 1
+            local entry = f.archive_entries[i]
+            if entry then return entry end
+        end
+    end
+    function reader:extractToPath(path, destination)
+        if f.archive_fail_path == path then self.err = "extract_failed"; return false end
+        local data = py_archive_data(path)
+        if not data then self.err = "missing_archive_data"; return false end
+        local file = io.open(destination, "wb")
+        if not file then self.err = "cannot_write_archive_entry"; return false end
+        file:write(data); file:close(); return true
+    end
+    function reader:close() end
+    return reader
 end
 local modules = {
     ["ui/widget/container/widgetcontainer"] = { extend = function(_, t) return t end },
     ["ui/uimanager"] = ui,
     ["ui/widget/infomessage"] = { new = function(_, t) return t end },
     ["ui/widget/inputdialog"] = {},
+    ["ui/widget/confirmbox"] = confirm,
     ["ui/widget/textboxwidget"] = text,
     ["ui/font"] = { getFace = function(_, _, size)
         return { size = math.ceil(size * (f.screen_scale or 1)) }
@@ -153,7 +195,9 @@ local modules = {
         if not file then return false end
         local data = file:read("*a")
         file:close()
-        if data == test_png or data == alternate_test_png then return true, { data = "decoded" } end
+        if data == test_png or data == alternate_test_png or data == date_png or data == dark_png then
+            return true, { data = "decoded" }
+        end
         return false, "invalid PNG"
     end },
     ["ui/renderimage"] = {
@@ -177,6 +221,7 @@ local modules = {
     } },
     ["util"] = { makePath = function(path) py_mkdir(path); return true end },
     ["ffi/util"] = ffi,
+    ["ffi/archiver"] = archiver,
     ["socket.http"] = http,
     ["socketutil"] = { set_timeout = function() end },
     ["ui/network/manager"] = {
@@ -214,6 +259,7 @@ function newPlugin()
 end
 obj = newPlugin()
 wallpaper = dofile(test_root .. "/wallpaper.lua")
+updater = dofile(test_root .. "/updater.lua")
 '''
 
 
@@ -221,10 +267,13 @@ class PluginTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="yiyan-check-")
         self.path = Path(self.tmp.name)
+        self.archive_files = {}
         self.lua = LuaRuntime(unpack_returned_tuples=True)
         g = self.lua.globals()
         g.test_root, g.test_dir = str(ROOT), str(self.path)
         g.test_png = PNG
+        g.date_png = (ROOT / "assets/date-card-background.png").read_bytes()
+        g.dark_png = (ROOT / "assets/dark-card-background.png").read_bytes()
         g.py_mkdir = lambda p: Path(p).mkdir(parents=True, exist_ok=True)
         g.py_mode = lambda p, _: "directory" if Path(p).is_dir() else "file" if Path(p).is_file() else None
         g.py_symlink_mode = lambda p, key: "link" if Path(p).is_symlink() else g.py_mode(p, key)
@@ -233,6 +282,7 @@ class PluginTests(unittest.TestCase):
         g.py_listdir = lambda p: self.lua.table_from(sorted(x.name for x in Path(p).iterdir()))
         g.py_encode = lambda v: json.dumps(self.to_python(v), ensure_ascii=False)
         g.py_decode = lambda s: self.to_lua(json.loads(s))
+        g.py_archive_data = lambda path: self.archive_files.get(path)
         self.lua.execute(MOCKS)
         g.test_clock = int(datetime(2026, 11, 4, 8, tzinfo=timezone.utc).timestamp())
         self.lua.execute("os.time = function() return test_clock end")
@@ -258,7 +308,11 @@ class PluginTests(unittest.TestCase):
         return value
 
     def to_lua(self, value):
-        return self.lua.table_from({k: self.to_lua(v) for k, v in value.items()}) if isinstance(value, dict) else value
+        if isinstance(value, dict):
+            return self.lua.table_from({k: self.to_lua(v) for k, v in value.items()})
+        if isinstance(value, list):
+            return self.lua.table_from([self.to_lua(v) for v in value])
+        return value
 
     def refresh(self, fetch_new=False):
         self.obj.refreshDaily(self.obj, True, fetch_new)
@@ -284,6 +338,180 @@ class PluginTests(unittest.TestCase):
         self.obj.addToMainMenu(self.obj, menu)
         return next(item.sub_item_table for _, item in menu.yiyan.sub_item_table.items()
                     if item.text == "封面类型")
+
+    def update_menu_item(self):
+        menu = self.lua.table()
+        self.obj.addToMainMenu(self.obj, menu)
+        return next(item for _, item in menu.yiyan.sub_item_table.items()
+                    if item.text == "检查在线更新")
+
+    def prepare_update_package(self, version="1.5.0", omit=None, bad_path=None):
+        files = {}
+        for relative in self.lua.globals().updater.FILES.values():
+            path = ROOT / relative
+            data = path.read_bytes()
+            if relative in {"_meta.lua", "updater.lua"}:
+                data = data.replace(b'"1.4.0"', ('"' + version + '"').encode())
+            files["yiyan.koplugin/" + relative] = data
+        self.archive_files = files
+        entries = []
+        for path, data in files.items():
+            if path == omit:
+                continue
+            entries.append({"path": path, "mode": "file", "size": len(data)})
+        if bad_path:
+            entries.append({"path": bad_path, "mode": "file", "size": 1})
+            self.archive_files[bad_path] = b"x"
+        self.f.archive_entries = self.lua.table_from(entries)
+        self.f.update_package_data = b"fixture"
+        return files
+
+    def release_payload(self, version="1.5.0", size=None):
+        tag = "v" + version
+        name = f"yiyan.koplugin-{tag}-install.zip"
+        url = f"https://github.com/iamzhangjinpeng/yiyan.koplugin/releases/download/{tag}/{name}"
+        return {"tag_name": tag, "draft": False, "prerelease": False,
+                "assets": [{"name": name, "browser_download_url": url,
+                            "size": size if size is not None else len(self.f.update_package_data or b"fixture")}]}
+
+    def test_updater_compares_numeric_versions_and_rejects_untrusted_release_urls(self):
+        updater = self.lua.globals().updater
+        self.assertIn(f'version = "{updater.VERSION}"', (ROOT / "_meta.lua").read_text())
+        self.assertTrue(updater.isNewer("1.10.0", "1.9.9"))
+        self.assertFalse(updater.isNewer("1.4.0", "1.4.0"))
+        self.assertFalse(updater.isNewer("1.5.0-beta", "1.4.0"))
+        release = self.to_lua(self.release_payload())
+        update = updater.releaseToInstall(release, "1.4.0")
+        self.assertEqual(update.version, "1.5.0")
+        release.assets[1].browser_download_url = "https://example.com/untrusted.zip"
+        update, reason = updater.releaseToInstall(release, "1.4.0")
+        self.assertIsNone(update)
+        self.assertEqual(reason, "missing_asset")
+
+    def test_update_package_rejects_path_traversal(self):
+        self.prepare_update_package(bad_path="../../outside.lua")
+        stage_dir = self.path / "staging"
+        stage_dir.mkdir()
+        ok, reason = self.lua.globals().updater.extractPackage(
+            "fixture.zip", str(stage_dir), "1.5.0", self.lua.globals().wallpaper.isValidPNG)
+        self.assertFalse(ok)
+        self.assertEqual(reason, "unexpected_archive_entry")
+        self.assertFalse((self.path / "outside.lua").exists())
+
+    def test_update_menu_checks_github_only_after_manual_request_and_respects_wifi(self):
+        item = self.update_menu_item()
+        self.f.connected = False
+        item.callback()
+        self.assertIn("网络未连接", self.f.message)
+        self.assertFalse(self.f.update_checks or 0)
+        self.assertFalse(self.f.requests)
+
+        self.f.connected = True
+        self.f.update_release_body = json.dumps({"tag_name": "v1.4.0", "assets": []})
+        item.callback()
+        self.f.drain(self.f)
+        self.assertEqual(self.f.update_checks, 1)
+        self.assertEqual(self.f.requests, 0)
+        self.assertIn("已是最新版", self.f.message)
+
+    def test_online_update_downloads_validates_installs_and_prompts_for_restart(self):
+        files = self.prepare_update_package()
+        install_dir = self.path / "plugins" / "yiyan.koplugin"
+        (install_dir / "assets").mkdir(parents=True)
+        for relative in self.lua.globals().updater.FILES.values():
+            destination = install_dir / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(b"old plugin file")
+        self.obj.path = str(install_dir)
+        self.lua.execute(r'''
+            f.update_install_order = {}
+            local rename = os.rename
+            os.rename = function(source, destination)
+                if destination:match("/plugins/yiyan%.koplugin/") then
+                    table.insert(f.update_install_order, destination:match("([^/]+)$"))
+                end
+                return rename(source, destination)
+            end
+        ''')
+        payload = self.release_payload()
+        self.f.update_release_body = json.dumps(payload)
+
+        self.update_menu_item().callback()
+        self.f.drain(self.f)
+        self.assertIn("v1.5.0", self.f.confirm.text)
+        self.assertEqual(self.f.update_checks, 1)
+        self.assertEqual(self.f.update_downloads or 0, 0)
+
+        self.f.confirm.ok_callback()
+        self.f.drain(self.f)
+        self.assertEqual(self.f.update_downloads, 1)
+        self.assertIn("已更新到 v1.5.0", self.f.confirm.text)
+        self.assertFalse(self.f.restarted or False)
+        for archive_path, data in files.items():
+            relative = archive_path.removeprefix("yiyan.koplugin/")
+            self.assertEqual((install_dir / relative).read_bytes(), data)
+        self.assertEqual(list(self.f.update_install_order.values()), [
+            "lyrics-background.png", "date-card-background.png", "dark-card-background.png",
+            "wallpaper.lua", "updater.lua", "main.lua", "_meta.lua",
+        ])
+
+        self.f.confirm.ok_callback()
+        self.assertTrue(self.f.restarted)
+
+    def test_online_update_rejects_incomplete_package_without_changing_installed_files(self):
+        self.prepare_update_package(omit="yiyan.koplugin/updater.lua")
+        install_dir = self.path / "plugins" / "yiyan.koplugin"
+        (install_dir / "assets").mkdir(parents=True)
+        before = {}
+        for relative in self.lua.globals().updater.FILES.values():
+            destination = install_dir / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(b"old " + relative.encode())
+            before[relative] = destination.read_bytes()
+        self.obj.path = str(install_dir)
+        self.f.update_release_body = json.dumps(self.release_payload())
+
+        self.update_menu_item().callback()
+        self.f.drain(self.f)
+        self.f.confirm.ok_callback()
+        self.f.drain(self.f)
+        self.assertIn("校验失败", self.f.message)
+        self.assertFalse(self.f.restarted or False)
+        for relative, data in before.items():
+            self.assertEqual((install_dir / relative).read_bytes(), data)
+
+    def test_failed_update_replacement_rolls_back_already_replaced_files(self):
+        files = self.prepare_update_package()
+        install_dir = self.path / "plugins" / "yiyan.koplugin"
+        (install_dir / "assets").mkdir(parents=True)
+        stage_dir = self.path / "stage"
+        for archive_path, data in files.items():
+            relative = archive_path.removeprefix("yiyan.koplugin/")
+            staged = stage_dir / "yiyan.koplugin" / relative
+            staged.parent.mkdir(parents=True, exist_ok=True)
+            staged.write_bytes(data)
+            destination = install_dir / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(b"old " + relative.encode())
+        old_files = {relative: (install_dir / relative).read_bytes()
+                     for relative in self.lua.globals().updater.FILES.values()}
+        self.lua.globals().test_install_dir = str(install_dir)
+        self.lua.globals().test_stage_dir = str(stage_dir)
+        self.lua.execute(r'''
+            local rename = os.rename
+            os.rename = function(source, destination)
+                if source:match("/updater%.lua$") then return nil, "fixture rename failure" end
+                return rename(source, destination)
+            end
+            local updater = dofile(test_root .. "/updater.lua")
+            local ffi = package.loaded["ffi/util"]
+            rollback_ok, rollback_error = updater.install(test_install_dir, test_stage_dir, ffi.copyFile)
+            os.rename = rename
+        ''')
+        self.assertFalse(self.lua.globals().rollback_ok)
+        self.assertEqual(self.lua.globals().rollback_error, "cannot_replace_install")
+        for relative, data in old_files.items():
+            self.assertEqual((install_dir / relative).read_bytes(), data)
 
     def test_cover_menu_switches_and_persists_styles_without_refetching(self):
         self.f.screen_width, self.f.screen_height = 1072, 1448

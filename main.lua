@@ -5,6 +5,7 @@ local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local UIManager = require("ui/uimanager")
 local InfoMessage = require("ui/widget/infomessage")
 local InputDialog = require("ui/widget/inputdialog")
+local ConfirmBox = require("ui/widget/confirmbox")
 local Device = require("device")
 local util = require("util")
 local ffiutil = require("ffi/util")
@@ -19,6 +20,7 @@ local time = require("ui/time")
 local _ = require("gettext")
 local plugin_dir = debug.getinfo(1, "S").source:match("^@(.*/)") or "plugins/yiyan.koplugin/"
 local Wallpaper = dofile(plugin_dir .. "wallpaper.lua")
+local Updater = dofile(plugin_dir .. "updater.lua")
 
 local Yiyan = WidgetContainer:extend{ name = "yiyan" }
 
@@ -27,6 +29,9 @@ local STARTUP_DELAY = 8
 local CHECK_INTERVAL = 5 * 60
 local RATE_LIMIT_INTERVAL = 60 * 60
 local HTTP_TIMEOUT = 20
+local UPDATE_CHECK_TIMEOUT = 20
+local UPDATE_DOWNLOAD_TIMEOUT = 120
+local UPDATE_MAX_RESPONSE_SIZE = 256 * 1024
 local POLL_INTERVAL = 0.125
 local UTC_OFFSET = 8 * 3600 -- 一言壁纸统一按北京时间归档
 local DAY_SECONDS = 24 * 60 * 60
@@ -59,6 +64,7 @@ local active_worker
 local active_instance
 local last_request
 local staging_id = 0
+local update_staging_id = 0
 local function workerNow() return time.to_s(time.boottime_or_monotonic()) end
 local function todayDate(now)
     return os.date("!%Y%m%d", (now or os.time()) + UTC_OFFSET)
@@ -502,6 +508,259 @@ function Yiyan:onNetworkConnected()
     if active_instance == self and not self._stopped then self:_schedule(2) end
 end
 
+local function pluginPath(self)
+    local path = type(self.path) == "string" and self.path ~= "" and self.path
+        or plugin_dir:gsub("/$", "")
+    return path:gsub("/+$", "")
+end
+
+local function createUpdateStage(self)
+    local prefix = pluginPath(self) .. "/.yiyan-update-" .. os.time() .. "-"
+    for _ = 1, 32 do
+        update_staging_id = update_staging_id + 1
+        local path = prefix .. update_staging_id
+        if lfs.mkdir(path) then return path end
+        if not lfs.symlinkattributes(path, "mode") then return nil end
+    end
+end
+
+local function runUpdateWorker(self, timeout, task, callback)
+    if active_worker then callback(nil, "busy"); return end
+    local called, pid, read_fd = pcall(ffiutil.runInSubProcess, function(_, child_write_fd)
+        local ok, result, err = pcall(task)
+        if not ok then
+            result, err = nil, "network_error"
+        end
+        if type(result) ~= "string" then
+            result = "ERR\n" .. tostring(err or "network_error"):gsub("[^%w_]", "_")
+        end
+        ffiutil.writeToFD(child_write_fd, result, true)
+    end, true)
+    if not called or not pid then
+        logger.warn("Yiyan: cannot start update worker", tostring(read_fd or pid))
+        callback(nil, "not_started")
+        return
+    end
+
+    local worker = { deadline = workerNow() + timeout }
+    active_worker = worker
+    UIManager:preventStandby()
+    local function poll()
+        if active_worker ~= worker then return end
+        if not ffiutil.isSubProcessDone(pid) then
+            worker.timed_out = worker.timed_out or workerNow() >= worker.deadline
+            if worker.cancelled or worker.timed_out then ffiutil.terminateSubProcess(pid) end
+            UIManager:scheduleIn(POLL_INTERVAL, poll)
+            return
+        end
+
+        active_worker = nil
+        UIManager:allowStandby()
+        if worker.cancelled then
+            callback(nil, "cancelled")
+            return
+        end
+        local read_ok, response = pcall(ffiutil.readAllFromFD, read_fd)
+        local err = read_ok and type(response) == "string" and response:match("^ERR\n([%w_]+)$")
+        if worker.timed_out then
+            callback(nil, "timeout")
+        elseif not read_ok or type(response) ~= "string" then
+            callback(nil, "network_error")
+        elseif err then
+            callback(nil, err)
+        else
+            callback(response)
+        end
+    end
+    worker.cancel = function()
+        if worker.cancelled then return end
+        worker.cancelled = true
+        UIManager:unschedule(poll)
+        poll()
+    end
+    UIManager:scheduleIn(POLL_INTERVAL, poll)
+end
+
+local function updateMessage(self, message)
+    if self._stopped then return end
+    UIManager:show(InfoMessage:new{ text = message, timeout = 4 })
+end
+
+function Yiyan:checkForUpdate()
+    if self._stopped then return end
+    if self._busy or active_worker then
+        updateMessage(self, _("一言任务正在进行中，请稍后再检查更新"))
+        return
+    end
+    if not networkIsConnected() then
+        updateMessage(self, _("网络未连接，请联网后重试"))
+        return
+    end
+
+    updateMessage(self, _("正在检查一言壁纸更新…"))
+    runUpdateWorker(self, UPDATE_CHECK_TIMEOUT, function()
+        socketutil:set_timeout(UPDATE_CHECK_TIMEOUT, UPDATE_CHECK_TIMEOUT)
+        local chunks, size = {}, 0
+        local ok, code = http.request{
+            url = Updater.RELEASE_API,
+            method = "GET",
+            headers = {
+                ["User-Agent"] = "KOReader-yiyan.koplugin/" .. Updater.VERSION,
+                ["Accept"] = "application/vnd.github+json",
+                ["X-GitHub-Api-Version"] = "2022-11-28",
+            },
+            redirect = false,
+            sink = function(chunk, sink_err)
+                if sink_err then return nil, sink_err end
+                if chunk then
+                    size = size + #chunk
+                    if size > UPDATE_MAX_RESPONSE_SIZE then return nil, "response_too_large" end
+                    chunks[#chunks + 1] = chunk
+                end
+                return 1
+            end,
+        }
+        if not ok then return nil, "network_error" end
+        if tonumber(code) ~= 200 then return nil, "http_error" end
+        local decoded, release = pcall(json.decode, table.concat(chunks))
+        if not decoded then return nil, "invalid_release" end
+        local update, reason = Updater.releaseToInstall(release, Updater.VERSION)
+        if reason == "up_to_date" then return "CURRENT" end
+        if not update then return nil, reason or "invalid_release" end
+        local encoded_ok, encoded = pcall(json.encode, update)
+        if not encoded_ok or type(encoded) ~= "string" then return nil, "invalid_release" end
+        return "UPDATE\n" .. encoded
+    end, function(result, err)
+        if self._stopped then return end
+        if not result then
+            updateMessage(self, err == "cancelled" and _("更新检查已取消") or _("检查更新失败，请检查网络后重试"))
+            return
+        end
+        if result == "CURRENT" then
+            updateMessage(self, _("一言壁纸已是最新版 v") .. Updater.VERSION)
+            return
+        end
+        local encoded = result:match("^UPDATE\n(.+)$")
+        local decoded, plan = pcall(json.decode, encoded or "")
+        if not decoded or type(plan) ~= "table" then
+            updateMessage(self, _("GitHub 返回的更新信息无法读取"))
+            return
+        end
+        local update = Updater.releaseToInstall({ tag_name = plan.tag,
+            assets = {{ name = plan.name, browser_download_url = plan.url, size = plan.size }} },
+            Updater.VERSION)
+        if not update then
+            updateMessage(self, _("没有找到可用的正式安装包，请稍后再试"))
+            return
+        end
+        UIManager:show(ConfirmBox:new{
+            text = _("发现一言壁纸新版本 v") .. update.version
+                .. "\n" .. _("当前版本：v") .. Updater.VERSION
+                .. "\n\n" .. _("下载并安装后需要重启 KOReader。现在继续吗？"),
+            ok_text = _("下载并安装"),
+            cancel_text = _("稍后"),
+            ok_callback = function() self:downloadUpdate(update) end,
+        })
+    end)
+end
+
+function Yiyan:downloadUpdate(update)
+    if self._stopped then return end
+    if self._busy or active_worker then
+        updateMessage(self, _("一言任务正在进行中，请稍后再更新"))
+        return
+    end
+    if not networkIsConnected() then
+        updateMessage(self, _("网络未连接，请联网后重试"))
+        return
+    end
+
+    local stage_dir = createUpdateStage(self)
+    if not stage_dir then
+        updateMessage(self, _("无法创建更新临时目录，请检查插件目录权限"))
+        return
+    end
+    local zip_path = stage_dir .. "/update.zip"
+    updateMessage(self, _("正在下载一言壁纸 v") .. update.version)
+    runUpdateWorker(self, UPDATE_DOWNLOAD_TIMEOUT, function()
+        socketutil:set_timeout(30, UPDATE_DOWNLOAD_TIMEOUT)
+        local file = io.open(zip_path, "wb")
+        if not file then return nil, "cannot_write_package" end
+        local size, write_error = 0, nil
+        local ok, code = http.request{
+            url = update.url,
+            method = "GET",
+            headers = { ["User-Agent"] = "KOReader-yiyan.koplugin/" .. Updater.VERSION },
+            redirect = true,
+            sink = function(chunk, sink_err)
+                if sink_err then return nil, sink_err end
+                if chunk then
+                    size = size + #chunk
+                    if size > Updater.MAX_PACKAGE_SIZE or size > update.size then
+                        return nil, "package_too_large"
+                    end
+                    local written, err = file:write(chunk)
+                    if not written then write_error = err or "cannot_write_package"; return nil, write_error end
+                end
+                return 1
+            end,
+        }
+        local close_ok = file:close()
+        if not ok then os.remove(zip_path); return nil, write_error or "download_failed" end
+        if tonumber(code) ~= 200 then os.remove(zip_path); return nil, "download_failed" end
+        if not close_ok or size ~= update.size then os.remove(zip_path); return nil, "package_size_mismatch" end
+        return "ok"
+    end, function(result, err)
+        if not result then
+            Updater.cleanup(stage_dir)
+            if not self._stopped then
+                updateMessage(self, err == "cancelled" and _("更新已取消") or _("更新下载失败，请检查网络后重试"))
+            end
+            return
+        end
+        if self._stopped then Updater.cleanup(stage_dir); return end
+        local extracted_call, extracted, extract_error = pcall(Updater.extractPackage,
+            zip_path, stage_dir, update.version, Wallpaper.isValidPNG)
+        if not extracted_call then extracted, extract_error = false, "invalid_archive" end
+        if not extracted then
+            Updater.cleanup(stage_dir)
+            logger.warn("Yiyan: update package validation failed", tostring(extract_error))
+            updateMessage(self, _("更新包校验失败，当前版本未更改"))
+            return
+        end
+        local install_call, installed, install_error = pcall(Updater.install,
+            pluginPath(self), stage_dir, ffiutil.copyFile)
+        if not install_call then
+            logger.warn("Yiyan: unexpected update installation error", tostring(installed))
+            updateMessage(self, _("安装时发生意外错误，备份保留在：") .. stage_dir)
+            return
+        end
+        if not installed then
+            logger.warn("Yiyan: update installation failed", tostring(install_error))
+            if install_error == "rollback_incomplete" then
+                updateMessage(self, _("自动回滚未完成，备份保留在：") .. stage_dir)
+            else
+                Updater.cleanup(stage_dir)
+                updateMessage(self, _("更新安装失败，当前版本已恢复"))
+            end
+            return
+        end
+        Updater.cleanup(stage_dir)
+        UIManager:show(ConfirmBox:new{
+            text = _("一言壁纸已更新到 v") .. update.version .. "\n\n" .. _("重启 KOReader 后生效。现在重启吗？"),
+            ok_text = _("现在重启"),
+            cancel_text = _("稍后"),
+            ok_callback = function()
+                if UIManager.restartKOReader then
+                    UIManager:restartKOReader()
+                else
+                    updateMessage(self, _("请完全退出并重新打开 KOReader 以启用更新"))
+                end
+            end,
+        })
+    end)
+end
+
 function Yiyan:onCloseWidget()
     self._stopped = true
     if self._check_callback then UIManager:unschedule(self._check_callback); self._check_callback = nil end
@@ -545,7 +804,7 @@ function Yiyan:requestSentence(date, response_path, work_dir, replacement, callb
             local request_ok, code = http.request{
                 url = url,
                 method = "GET",
-                headers = { ["User-Agent"] = "KOReader-yiyan.koplugin/1.3.2" },
+                headers = { ["User-Agent"] = "KOReader-yiyan.koplugin/" .. Updater.VERSION },
                 redirect = false,
                 sink = function(chunk, sink_err)
                     if sink_err then return nil, sink_err end
@@ -1196,6 +1455,7 @@ function Yiyan:addToMainMenu(menu_items)
             { text = _("网络诊断"), callback = function()
                 UIManager:show(InfoMessage:new{ text = self:networkDiagnostics() })
             end },
+            { text = _("检查在线更新"), callback = function() self:checkForUpdate() end },
             { text = _("设置屏保图片目录"), callback = function() self:chooseOutputDirectory() end },
         },
     }
