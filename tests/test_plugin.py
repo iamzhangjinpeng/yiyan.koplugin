@@ -608,15 +608,14 @@ class PluginTests(unittest.TestCase):
         entries[0].callback()
         self.f.drain(self.f)
         self.assertEqual(self.f.requests, 2)
+        self.assertIn("可手动立即重试", self.f.message)
         self.assertEqual(cache.read_bytes(), old_cache)
         self.assertEqual(display.read_bytes(), PNG)
 
         self.refresh()
-        entries[0].callback()
-        self.f.drain(self.f)
         self.assertEqual(self.f.requests, 2)
-        self.assertIn("手动重试", self.f.message)
-        self.lua.execute("test_clock = test_clock + 300")
+        self.assertIn("已有今日句子", self.obj.networkDiagnostics(self.obj))
+        self.assertIn("可手动立即重试", self.obj.networkDiagnostics(self.obj))
         new_png = (ROOT / "docs/demo.png").read_bytes()
         self.lua.globals().alternate_test_png = self.f.invalid_png = new_png
         self.f.raw_response = json.dumps({**self.payload, "hitokoto": "手动获取的新句子"})
@@ -628,6 +627,28 @@ class PluginTests(unittest.TestCase):
         self.assertEqual(display.read_bytes(), new_png)
         self.refresh()
         self.assertEqual(self.f.requests, 3)
+
+    def test_manual_menu_bypasses_normal_retry_interval_but_automatic_retry_waits(self):
+        self.f.http_error = True
+        self.refresh()
+        self.assertEqual(self.f.requests, 1)
+        self.f.connected = False
+        self.assertIn("联网后可手动立即重试", self.obj.networkDiagnostics(self.obj))
+        self.f.connected = True
+
+        # An automatic check remains subject to the five-minute retry window.
+        self.refresh()
+        self.assertEqual(self.f.requests, 1)
+
+        menu = self.lua.table()
+        self.obj.addToMainMenu(self.obj, menu)
+        manual = next(item.callback for _, item in menu.yiyan.sub_item_table.items()
+                      if item.text == "重新生成今日壁纸")
+        self.f.http_error = False
+        manual()
+        self.f.drain(self.f)
+        self.assertEqual(self.f.requests, 2)
+        self.assertTrue((self.path / (self.date + ".png")).exists())
 
     def test_manual_response_recovers_after_cache_promotion_failure_and_restart(self):
         self.refresh()
@@ -790,6 +811,13 @@ class PluginTests(unittest.TestCase):
         self.f.http_code = 429
         self.refresh()
         self.assertIn("一小时", self.f.message)
+        menu = self.lua.table()
+        self.obj.addToMainMenu(self.obj, menu)
+        manual = next(item.callback for _, item in menu.yiyan.sub_item_table.items()
+                      if item.text == "重新生成今日壁纸")
+        manual()
+        self.assertEqual(self.f.requests, 1)
+        self.assertIn("限流", self.f.message)
         self.open_output_directory_dialog()
         self.lua.execute("pending_save(); test_clock = test_clock + 3599")
         self.f.http_code = 200

@@ -1008,7 +1008,7 @@ function Yiyan:cleanupOldImages(dir, keep_date)
     end
 end
 
-function Yiyan:refreshDaily(show_message, fetch_new, local_only)
+function Yiyan:refreshDaily(show_message, fetch_new, local_only, manual_request)
     if self._stopped then return end
     local function notify(message)
         if show_message and not self._stopped then UIManager:show(InfoMessage:new{ text = message }) end
@@ -1104,7 +1104,7 @@ function Yiyan:refreshDaily(show_message, fetch_new, local_only)
             or _("一言服务暂时限流，冷却结束后会自动重试"))
         return
     end
-    if now < deadline then
+    if now < deadline and not manual_request then
         notify(prior_success and _("上次请求未完成，请稍后手动重试")
             or _("上次请求未完成，稍后会自动重试"))
         return
@@ -1173,8 +1173,8 @@ function Yiyan:refreshDaily(show_message, fetch_new, local_only)
                 end
                 notify(_("一言服务暂时限流，一小时后再试"))
             else
-                notify(prior_success and _("未能取得新句子，已保留当前壁纸")
-                    or _("今日一言请求失败，稍后会自动重试"))
+                notify(prior_success and _("未能取得新句子，已保留当前壁纸，可手动立即重试")
+                    or _("今日一言请求失败，稍后会自动重试，也可手动立即重试"))
             end
         elseif not finishResponse() then
             saveAttemptHistory(date, "success")
@@ -1230,10 +1230,14 @@ function Yiyan:networkDiagnostics()
         request = _("后台请求进行中")
     elseif (marker_mode and not marker) or (not fetched and (cache_conflict or image_exists)) then
         request = _("同名文件冲突")
-    elseif now < deadline then
+    elseif now < deadline and limited then
         local wait = _("%d 分钟后可重试"):format(math.ceil((deadline - now) / 60))
-        local reason = limited and _("服务限流") or (fetched and _("手动刷新") or _("等待重试"))
-        request = reason .. "（" .. wait .. "）"
+        request = _("服务限流") .. "（" .. wait .. "）"
+    elseif now < deadline then
+        local wait = _("%d 分钟后"):format(math.ceil((deadline - now) / 60))
+        local manual_hint = connected and _("可手动立即重试") or _("联网后可手动立即重试")
+        request = fetched and (_("已有今日句子") .. "；" .. manual_hint)
+            or (_("自动重试") .. wait .. "；" .. manual_hint)
     elseif fetched then
         request = _("今日无需自动请求")
     elseif not connected then
@@ -1452,7 +1456,7 @@ function Yiyan:addToMainMenu(menu_items)
             },
             { text = _("句子类型（下次请求生效）"), sub_item_table = categories },
             { text = _("封面类型"), sub_item_table = covers },
-            { text = _("重新生成今日壁纸"), callback = function() self:refreshDaily(true, true) end },
+            { text = _("重新生成今日壁纸"), callback = function() self:refreshDaily(true, true, false, true) end },
             { text = _("网络诊断"), callback = function()
                 UIManager:show(InfoMessage:new{ text = self:networkDiagnostics() })
             end },
