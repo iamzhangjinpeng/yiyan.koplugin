@@ -1,7 +1,7 @@
 -- Online release updater for yiyan.koplugin.
 
 local Updater = {
-    VERSION = "1.4.2",
+    VERSION = "1.4.3",
     RELEASE_API = "https://api.github.com/repos/iamzhangjinpeng/yiyan.koplugin/releases/latest",
     RELEASE_BASE = "https://github.com/iamzhangjinpeng/yiyan.koplugin/releases/download/",
     MAX_PACKAGE_SIZE = 2 * 1024 * 1024,
@@ -73,6 +73,107 @@ function Updater.releaseToInstall(release, installed_version)
         end
     end
     return nil, "missing_asset"
+end
+
+local function hostMatches(cert, host)
+    if cert and cert.checkhost then return cert:checkhost(host) == true end
+    local ok, extensions = pcall(function() return cert and cert:extensions() end)
+    local names = ok and extensions and extensions["2.5.29.17"]
+    local wildcard = host:gsub("^[^.]+", "*", 1)
+    for _, name in ipairs(names and names.dNSName or {}) do
+        name = name:lower()
+        if name == host or name == wildcard then return true end
+    end
+    return false
+end
+
+local function allowedHost(host, path, asset)
+    if not asset then
+        return host == "api.github.com" and path == "/repos/iamzhangjinpeng/yiyan.koplugin/releases/latest"
+    end
+    if host == "github.com" then
+        return path:match("^/iamzhangjinpeng/yiyan%.koplugin/releases/download/v%d+%.%d+%.%d+/yiyan%.koplugin%-v%d+%.%d+%.%d+%-install%.zip$") ~= nil
+    end
+    return host == "release-assets.githubusercontent.com" or host == "objects.githubusercontent.com"
+end
+
+-- KOReader's default socket.http setup can inherit a proxy that LuaSec cannot
+-- tunnel through. Use verified TLS directly and validate the peer for every hop.
+function Updater.fetch(url, limit, asset)
+    if type(url) ~= "string" or type(limit) ~= "number" or limit <= 0 then
+        return nil, "invalid_request"
+    end
+    local http_ok, http = pcall(require, "socket.http")
+    local https_ok, https = pcall(require, "ssl.https")
+    if not http_ok or not http or not https_ok or not https then return nil, "tls_unavailable" end
+    local socketutil_ok, socketutil = pcall(require, "socketutil")
+    if not socketutil_ok or not socketutil then return nil, "network_unavailable" end
+    local timeout_ok = pcall(socketutil.set_timeout, socketutil, 8, 18)
+    if not timeout_ok then return nil, "network_unavailable" end
+    local tls_ok, tls = pcall(https.tcp, { verify = "peer", cafile = "./data/ca-bundle.crt" })
+    if not tls_ok or type(tls) ~= "function" then return nil, "tls_unavailable" end
+
+    http.PROXY = nil
+    for _ = 1, 4 do
+        local host, path = url:match("^https://([%w%.%-]+)(/[^%s%c]*)$")
+        if not host or not allowedHost(host:lower(), path, asset == true) then
+            return nil, "redirect_error"
+        end
+        host = host:lower()
+        local chunks, size, sink_error = {}, 0, nil
+        local ok, code, headers = http.request{
+            url = "https://" .. host .. ":443" .. path,
+            method = "GET",
+            redirect = false,
+            headers = {
+                ["User-Agent"] = "KOReader-yiyan.koplugin/" .. Updater.VERSION,
+                Accept = asset and "application/octet-stream" or "application/vnd.github+json",
+                ["X-GitHub-Api-Version"] = "2022-11-28",
+            },
+            create = function()
+                local connection = tls()
+                local connect = connection.connect
+                function connection:connect(peer, port)
+                    local connected, err = connect(self, peer, port)
+                    if not connected then return nil, err end
+                    if peer ~= host or not hostMatches(self:getpeercertificate(), host) then
+                        self:close()
+                        return nil, "TLS hostname mismatch"
+                    end
+                    return connected
+                end
+                return connection
+            end,
+            sink = function(chunk, err)
+                if err then sink_error = err; return nil, err end
+                if chunk then
+                    size = size + #chunk
+                    if size > limit then sink_error = "response_too_large"; return nil, sink_error end
+                    chunks[#chunks + 1] = chunk
+                end
+                return 1
+            end,
+        }
+        if not ok then
+            if sink_error then return nil, sink_error end
+            local transport_error = tostring(code or ""):lower()
+            if transport_error:find("hostname mismatch", 1, true) then return nil, "tls_hostname_mismatch" end
+            if transport_error:find("tls", 1, true) or transport_error:find("certificate", 1, true) then
+                return nil, "tls_error"
+            end
+            if transport_error:find("timeout", 1, true) or transport_error:find("timed out", 1, true) then
+                return nil, "timeout"
+            end
+            return nil, "network_error"
+        end
+        if tonumber(code) == 200 then return table.concat(chunks) end
+        if not asset or (code ~= 301 and code ~= 302 and code ~= 303 and code ~= 307 and code ~= 308)
+                or not headers or type(headers.location) ~= "string" then
+            return nil, "http_" .. tostring(code or "error")
+        end
+        url = headers.location
+    end
+    return nil, "redirect_error"
 end
 
 local function filePath(root, relative)

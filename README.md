@@ -2,7 +2,12 @@
 
 为 Kindle 上的 KOReader 每天获取一句[一言](https://developer.hitokoto.cn/sentence/)，生成设备分辨率的灰度 PNG，并可自动把 KOReader 睡眠屏保切换为这张壁纸。
 
-**v1.4.2** · [下载 Kindle 安装包](https://github.com/iamzhangjinpeng/yiyan.koplugin/releases/download/v1.4.2/yiyan.koplugin-v1.4.2-install.zip) · [更新说明](https://github.com/iamzhangjinpeng/yiyan.koplugin/releases/tag/v1.4.2)
+**v1.4.3** · [下载 Kindle 安装包](https://github.com/iamzhangjinpeng/yiyan.koplugin/releases/download/v1.4.3/yiyan.koplugin-v1.4.3-install.zip) · [更新说明](https://github.com/iamzhangjinpeng/yiyan.koplugin/releases/tag/v1.4.3)
+
+## v1.4.3 更新内容
+
+- 修复在线更新网络错误：使用带证书和主机名校验的 TLS 连接，清除更新子进程中的代理配置，并限制 GitHub 安装包跳转域名。
+- 更新失败时按超时、TLS、限流、跳转和包大小等原因显示对应提示。
 
 ## v1.4.2 更新内容
 

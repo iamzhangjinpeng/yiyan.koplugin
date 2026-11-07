@@ -18,7 +18,7 @@ BROKEN_PNG = b"\x89PNG\r\n\x1a\n" + b"fixture" * 4 + b"\0\0\0\0IEND\xaeB`\x82"
 MOCKS = r'''
 f = { queue = {}, requests = 0, renders = 0, live_widgets = 0, locks = 0,
     paints = {}, shapes = {}, now = 0, connected = true, settings = { data = {} },
-    archive_entries = {} }
+    archive_entries = {}, update_tls_hosts = {}, update_http_hosts = {} }
 function f.settings:readSetting(k) return self.data[k] end
 function f.settings:saveSetting(k, v) self.data[k] = v end
 function f.settings:delSetting(k) self.data[k] = nil end
@@ -132,21 +132,43 @@ function http.request(request)
     if not opened then return nil, connection end
     f.request_url = request.url
     assert(request.method == "GET")
-    local data, code
-    if request.url:match("^https://api%.github%.com/") then
+    local host = assert(request.url:match("^https://([^/:]+)"))
+    local data, code, headers
+    if host == "api.github.com" or host == "github.com"
+            or host == "release-assets.githubusercontent.com" or host == "objects.githubusercontent.com" then
+        table.insert(f.update_http_hosts, host)
+        f.update_proxy = http.PROXY
+        if request.create then
+            local tls = request.create()
+            local connected, err = tls:connect(host, 443)
+            if not connected then connection:close(); return nil, err end
+        end
+    end
+    if host == "api.github.com" then
         f.update_checks = (f.update_checks or 0) + 1
         assert(request.redirect == false)
         data, code = f.update_release_body or f.raw_response, f.update_api_code or 200
-    elseif request.url:match("^https://github%.com/iamzhangjinpeng/yiyan%.koplugin/releases/download/") then
+    elseif host == "github.com" and request.url:match("/releases/download/") then
         f.update_downloads = (f.update_downloads or 0) + 1
-        assert(request.redirect == true)
+        assert(request.redirect == false)
+        if f.update_download_code and f.update_download_code ~= 200 then
+            code = f.update_download_code
+        else
+            code, headers = 302, { location = f.update_redirect_url
+                or "https://release-assets.githubusercontent.com/fixture.zip?token=test" }
+        end
+    elseif host == "release-assets.githubusercontent.com" or host == "objects.githubusercontent.com" then
+        assert(request.redirect == false)
         data, code = f.update_package_data or "package", f.update_download_code or 200
     else
         f.requests = f.requests + 1
         assert(request.redirect == false, "a redirect must not spend another request")
         data, code = f.raw_response, f.http_code or 200
     end
-    if f.http_error then return nil, "offline" end
+    if f.http_error then
+        return nil, type(f.http_error) == "string" and f.http_error or "offline"
+    end
+    if code == 302 then connection:close(); return 1, code, headers end
     local ok, err = request.sink(data)
     connection:close()
     if not ok then return nil, err end
@@ -224,6 +246,25 @@ local modules = {
     ["ffi/archiver"] = archiver,
     ["socket.http"] = http,
     ["socketutil"] = { set_timeout = function() end },
+    ["ssl.https"] = { tcp = function(config)
+        assert(config.verify == "peer")
+        assert(config.cafile == "./data/ca-bundle.crt")
+        return function()
+            local connection = {}
+            function connection:connect(host, port)
+                assert(port == 443)
+                table.insert(f.update_tls_hosts, host)
+                if f.bad_tls_host == host then return nil, "TLS certificate rejected" end
+                self.host = host
+                return true
+            end
+            function connection:getpeercertificate()
+                return { checkhost = function(_, host) return host == self.host end }
+            end
+            function connection:close() end
+            return connection
+        end
+    end },
     ["ui/network/manager"] = {
         isConnected = function() return f.connected end,
         isWifiOn = function() return f.wifi_on end,
@@ -441,11 +482,20 @@ class PluginTests(unittest.TestCase):
         self.f.drain(self.f)
         self.assertIn("v1.5.0", self.f.confirm.text)
         self.assertEqual(self.f.update_checks, 1)
+        self.assertEqual(list(self.f.update_tls_hosts.values()), ["api.github.com"])
+        self.assertEqual(list(self.f.update_http_hosts.values()), ["api.github.com"])
+        self.assertIsNone(self.f.update_proxy)
         self.assertEqual(self.f.update_downloads or 0, 0)
 
         self.f.confirm.ok_callback()
         self.f.drain(self.f)
         self.assertEqual(self.f.update_downloads, 1)
+        self.assertEqual(list(self.f.update_tls_hosts.values()), [
+            "api.github.com", "github.com", "release-assets.githubusercontent.com",
+        ])
+        self.assertEqual(list(self.f.update_http_hosts.values()), [
+            "api.github.com", "github.com", "release-assets.githubusercontent.com",
+        ])
         self.assertIn("已更新到 v1.5.0", self.f.confirm.text)
         self.assertFalse(self.f.restarted or False)
         for archive_path, data in files.items():
@@ -458,6 +508,34 @@ class PluginTests(unittest.TestCase):
 
         self.f.confirm.ok_callback()
         self.assertTrue(self.f.restarted)
+
+    def test_online_update_reports_tls_failure_and_rejects_untrusted_redirects(self):
+        self.f.bad_tls_host = "api.github.com"
+        self.update_menu_item().callback()
+        self.f.drain(self.f)
+        self.assertIn("TLS 连接失败", self.f.message)
+        self.assertIsNone(self.f.confirm)
+
+        self.lua.execute("f.update_tls_hosts = {}; f.update_http_hosts = {}")
+        self.f.bad_tls_host = None
+        self.f.raw_response = json.dumps(self.release_payload())
+        self.update_menu_item().callback()
+        self.f.drain(self.f)
+        self.assertIn("v1.5.0", self.f.confirm.text)
+        self.f.update_redirect_url = "https://attacker.example/package.zip"
+        self.f.confirm.ok_callback()
+        self.f.drain(self.f)
+        self.assertIn("跳转异常", self.f.message)
+        self.assertEqual(list(self.f.update_http_hosts.values()), [
+            "api.github.com", "github.com",
+        ])
+        self.assertFalse(list(self.path.glob("plugins/yiyan.koplugin/.yiyan-update-*")))
+
+    def test_online_update_reports_transport_timeout(self):
+        self.f.http_error = "timeout"
+        self.update_menu_item().callback()
+        self.f.drain(self.f)
+        self.assertIn("GitHub 超时", self.f.message)
 
     def test_online_update_rejects_incomplete_package_without_changing_installed_files(self):
         self.prepare_update_package(omit="yiyan.koplugin/updater.lua")

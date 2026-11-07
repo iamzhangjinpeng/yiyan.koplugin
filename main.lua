@@ -529,7 +529,10 @@ local function runUpdateWorker(self, timeout, task, callback)
     local called, pid, read_fd = pcall(ffiutil.runInSubProcess, function(_, child_write_fd)
         local ok, result, err = pcall(task)
         if not ok then
+            logger.warn("Yiyan: update worker failed", tostring(result))
             result, err = nil, "network_error"
+        elseif not result then
+            logger.warn("Yiyan: update request failed", tostring(err or "network_error"))
         end
         if type(result) ~= "string" then
             result = "ERR\n" .. tostring(err or "network_error"):gsub("[^%w_]", "_")
@@ -586,6 +589,30 @@ local function updateMessage(self, message)
     UIManager:show(InfoMessage:new{ text = message, timeout = 4 })
 end
 
+local function updateFailureMessage(err, checking)
+    if err == "cancelled" then return checking and _("更新检查已取消") or _("更新已取消") end
+    if err == "timeout" then return _("连接 GitHub 超时，请检查网络后重试") end
+    if err == "http_403" or err == "http_429" then return _("GitHub 暂时限流，请稍后再试") end
+    if err == "tls_error" or err == "tls_unavailable" or err == "tls_hostname_mismatch" then
+        return _("GitHub TLS 连接失败，请检查 Kindle 系统时间和网络后重试")
+    end
+    if err == "redirect_error" then return _("GitHub 下载跳转异常，当前版本未更改") end
+    if err == "network_error" or err == "network_unavailable" then
+        return _("无法连接 GitHub，请确认网络能访问 GitHub 后重试")
+    end
+    if err == "response_too_large" then return _("GitHub 返回内容超出大小限制，当前版本未更改") end
+    if err == "package_size_mismatch" then return _("安装包大小校验失败，当前版本未更改") end
+    if err == "cannot_write_package" then return _("无法保存安装包，请检查插件目录空间和权限") end
+    if err == "invalid_release" or err == "invalid_version" or err == "missing_asset"
+            or err == "invalid_asset_size" then
+        return _("GitHub 发布信息或安装包无效，当前版本未更改")
+    end
+    local status = type(err) == "string" and err:match("^http_(%d+)$")
+    if status then return _("GitHub 返回 HTTP ") .. status .. (checking and "" or _("，下载未完成")) end
+    return checking and _("检查更新失败，请确认网络能访问 GitHub 后重试")
+        or _("更新下载失败，请确认网络能访问 GitHub 后重试")
+end
+
 function Yiyan:checkForUpdate()
     if self._stopped then return end
     if self._busy or active_worker then
@@ -599,30 +626,9 @@ function Yiyan:checkForUpdate()
 
     updateMessage(self, _("正在检查一言壁纸更新…"))
     runUpdateWorker(self, UPDATE_CHECK_TIMEOUT, function()
-        socketutil:set_timeout(UPDATE_CHECK_TIMEOUT, UPDATE_CHECK_TIMEOUT)
-        local chunks, size = {}, 0
-        local ok, code = http.request{
-            url = Updater.RELEASE_API,
-            method = "GET",
-            headers = {
-                ["User-Agent"] = "KOReader-yiyan.koplugin/" .. Updater.VERSION,
-                ["Accept"] = "application/vnd.github+json",
-                ["X-GitHub-Api-Version"] = "2022-11-28",
-            },
-            redirect = false,
-            sink = function(chunk, sink_err)
-                if sink_err then return nil, sink_err end
-                if chunk then
-                    size = size + #chunk
-                    if size > UPDATE_MAX_RESPONSE_SIZE then return nil, "response_too_large" end
-                    chunks[#chunks + 1] = chunk
-                end
-                return 1
-            end,
-        }
-        if not ok then return nil, "network_error" end
-        if tonumber(code) ~= 200 then return nil, "http_error" end
-        local decoded, release = pcall(json.decode, table.concat(chunks))
+        local body, fetch_error = Updater.fetch(Updater.RELEASE_API, UPDATE_MAX_RESPONSE_SIZE, false)
+        if not body then return nil, fetch_error end
+        local decoded, release = pcall(json.decode, body)
         if not decoded then return nil, "invalid_release" end
         local update, reason = Updater.releaseToInstall(release, Updater.VERSION)
         if reason == "up_to_date" then return "CURRENT" end
@@ -633,7 +639,7 @@ function Yiyan:checkForUpdate()
     end, function(result, err)
         if self._stopped then return end
         if not result then
-            updateMessage(self, err == "cancelled" and _("更新检查已取消") or _("检查更新失败，请检查网络后重试"))
+            updateMessage(self, updateFailureMessage(err, true))
             return
         end
         if result == "CURRENT" then
@@ -683,38 +689,24 @@ function Yiyan:downloadUpdate(update)
     local zip_path = stage_dir .. "/update.zip"
     updateMessage(self, _("正在下载一言壁纸 v") .. update.version)
     runUpdateWorker(self, UPDATE_DOWNLOAD_TIMEOUT, function()
-        socketutil:set_timeout(30, UPDATE_DOWNLOAD_TIMEOUT)
+        local data, fetch_error = Updater.fetch(update.url, math.min(
+            Updater.MAX_PACKAGE_SIZE, update.size), true)
+        if not data then return nil, fetch_error end
+        if #data ~= update.size then return nil, "package_size_mismatch" end
         local file = io.open(zip_path, "wb")
         if not file then return nil, "cannot_write_package" end
-        local size, write_error = 0, nil
-        local ok, code = http.request{
-            url = update.url,
-            method = "GET",
-            headers = { ["User-Agent"] = "KOReader-yiyan.koplugin/" .. Updater.VERSION },
-            redirect = true,
-            sink = function(chunk, sink_err)
-                if sink_err then return nil, sink_err end
-                if chunk then
-                    size = size + #chunk
-                    if size > Updater.MAX_PACKAGE_SIZE or size > update.size then
-                        return nil, "package_too_large"
-                    end
-                    local written, err = file:write(chunk)
-                    if not written then write_error = err or "cannot_write_package"; return nil, write_error end
-                end
-                return 1
-            end,
-        }
+        local written, write_error = file:write(data)
         local close_ok = file:close()
-        if not ok then os.remove(zip_path); return nil, write_error or "download_failed" end
-        if tonumber(code) ~= 200 then os.remove(zip_path); return nil, "download_failed" end
-        if not close_ok or size ~= update.size then os.remove(zip_path); return nil, "package_size_mismatch" end
+        if not written or not close_ok then
+            os.remove(zip_path)
+            return nil, "cannot_write_package"
+        end
         return "ok"
     end, function(result, err)
         if not result then
             Updater.cleanup(stage_dir)
             if not self._stopped then
-                updateMessage(self, err == "cancelled" and _("更新已取消") or _("更新下载失败，请检查网络后重试"))
+                updateMessage(self, updateFailureMessage(err, false))
             end
             return
         end
