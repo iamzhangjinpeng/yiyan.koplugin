@@ -4,6 +4,7 @@ Requires lupa (Lua 5.1); all KOReader/device/network APIs are replaced with
 fixtures. No Hitokoto requests or Kindle files are touched.
 """
 import json
+import hashlib
 from pathlib import Path
 import tempfile
 import unittest
@@ -133,6 +134,7 @@ function http.request(request)
     f.request_url = request.url
     assert(request.method == "GET")
     local host = assert(request.url:match("^https://([^/:]+)"))
+    local path = assert(request.url:match("^https://[^/]+(/[^%?#]*)"))
     local data, code, headers
     if host == "api.github.com" or host == "github.com"
             or host == "release-assets.githubusercontent.com" or host == "objects.githubusercontent.com" then
@@ -144,19 +146,23 @@ function http.request(request)
             if not connected then connection:close(); return nil, err end
         end
     end
-    if host == "api.github.com" then
+    if host == "api.github.com" and path == "/repos/iamzhangjinpeng/yiyan.koplugin/releases/latest" then
         f.update_checks = (f.update_checks or 0) + 1
         assert(request.redirect == false)
         data, code = f.update_release_body or f.raw_response, f.update_api_code or 200
-    elseif host == "github.com" and request.url:match("/releases/download/") then
+    elseif host == "api.github.com" and path:match("^/repos/iamzhangjinpeng/yiyan%.koplugin/releases/assets/%d+$") then
         f.update_downloads = (f.update_downloads or 0) + 1
         assert(request.redirect == false)
+        assert(request.headers.Accept == "application/octet-stream")
         if f.update_download_code and f.update_download_code ~= 200 then
             code = f.update_download_code
         else
             code, headers = 302, { location = f.update_redirect_url
                 or "https://release-assets.githubusercontent.com/fixture.zip?token=test" }
         end
+    elseif host == "github.com" then
+        f.github_asset_requests = (f.github_asset_requests or 0) + 1
+        assert(false, "asset downloads must not request github.com")
     elseif host == "release-assets.githubusercontent.com" or host == "objects.githubusercontent.com" then
         assert(request.redirect == false)
         data, code = f.update_package_data or "package", f.update_download_code or 200
@@ -274,7 +280,7 @@ local modules = {
     ["json"] = { encode = py_encode, decode = py_decode },
     ["ffi/sha2"] = { md5 = function(data)
         return (data:gsub(".", function(c) return string.format("%02x", c:byte()) end))
-    end },
+    end, sha256 = py_sha256 },
     ["gettext"] = function(v) return v end,
     ["libs/libkoreader-lfs"] = {
         attributes = py_mode,
@@ -323,6 +329,8 @@ class PluginTests(unittest.TestCase):
         g.py_listdir = lambda p: self.lua.table_from(sorted(x.name for x in Path(p).iterdir()))
         g.py_encode = lambda v: json.dumps(self.to_python(v), ensure_ascii=False)
         g.py_decode = lambda s: self.to_lua(json.loads(s))
+        g.py_sha256 = lambda data: hashlib.sha256(
+            data if isinstance(data, bytes) else str(data).encode("latin-1")).hexdigest()
         g.py_archive_data = lambda path: self.archive_files.get(path)
         self.lua.execute(MOCKS)
         g.test_clock = int(datetime(2026, 11, 4, 8, tzinfo=timezone.utc).timestamp())
@@ -411,10 +419,15 @@ class PluginTests(unittest.TestCase):
     def release_payload(self, version="1.5.0", size=None):
         tag = "v" + version
         name = f"yiyan.koplugin-{tag}-install.zip"
-        url = f"https://github.com/iamzhangjinpeng/yiyan.koplugin/releases/download/{tag}/{name}"
+        asset_id = 987654321
+        url = f"https://api.github.com/repos/iamzhangjinpeng/yiyan.koplugin/releases/assets/{asset_id}"
+        data = self.f.update_package_data or b"fixture"
+        data = data if isinstance(data, bytes) else str(data).encode("latin-1")
         return {"tag_name": tag, "draft": False, "prerelease": False,
-                "assets": [{"name": name, "browser_download_url": url,
-                            "size": size if size is not None else len(self.f.update_package_data or b"fixture")}]}
+                "assets": [{"name": name, "url": url, "id": asset_id, "state": "uploaded",
+                            "digest": "sha256:" + hashlib.sha256(data).hexdigest(),
+                            "browser_download_url": f"https://github.com/iamzhangjinpeng/yiyan.koplugin/releases/download/{tag}/{name}",
+                            "size": size if size is not None else len(data)}]}
 
     def test_updater_compares_numeric_versions_and_rejects_untrusted_release_urls(self):
         updater = self.lua.globals().updater
@@ -425,10 +438,22 @@ class PluginTests(unittest.TestCase):
         release = self.to_lua(self.release_payload())
         update = updater.releaseToInstall(release, "1.4.0")
         self.assertEqual(update.version, "1.5.0")
-        release.assets[1].browser_download_url = "https://example.com/untrusted.zip"
+        release.assets[1].url = "https://example.com/untrusted.zip"
         update, reason = updater.releaseToInstall(release, "1.4.0")
         self.assertIsNone(update)
         self.assertEqual(reason, "missing_asset")
+
+        release = self.to_lua(self.release_payload())
+        release.assets[1].id = 0
+        update, reason = updater.releaseToInstall(release, "1.4.0")
+        self.assertIsNone(update)
+        self.assertEqual(reason, "invalid_asset_id")
+
+        release = self.to_lua(self.release_payload())
+        release.assets[1].digest = "sha1:" + "0" * 40
+        update, reason = updater.releaseToInstall(release, "1.4.0")
+        self.assertIsNone(update)
+        self.assertEqual(reason, "invalid_asset_digest")
 
     def test_update_package_rejects_path_traversal(self):
         self.prepare_update_package(bad_path="../../outside.lua")
@@ -476,6 +501,7 @@ class PluginTests(unittest.TestCase):
             end
         ''')
         payload = self.release_payload()
+        payload["assets"][0]["browser_download_url"] = "https://github.com/old/unreachable.zip"
         self.f.update_release_body = json.dumps(payload)
 
         self.update_menu_item().callback()
@@ -491,11 +517,12 @@ class PluginTests(unittest.TestCase):
         self.f.drain(self.f)
         self.assertEqual(self.f.update_downloads, 1)
         self.assertEqual(list(self.f.update_tls_hosts.values()), [
-            "api.github.com", "github.com", "release-assets.githubusercontent.com",
+            "api.github.com", "api.github.com", "release-assets.githubusercontent.com",
         ])
         self.assertEqual(list(self.f.update_http_hosts.values()), [
-            "api.github.com", "github.com", "release-assets.githubusercontent.com",
+            "api.github.com", "api.github.com", "release-assets.githubusercontent.com",
         ])
+        self.assertFalse(self.f.github_asset_requests or False)
         self.assertIn("已更新到 v1.5.0", self.f.confirm.text)
         self.assertFalse(self.f.restarted or False)
         for archive_path, data in files.items():
@@ -527,8 +554,35 @@ class PluginTests(unittest.TestCase):
         self.f.drain(self.f)
         self.assertIn("跳转异常", self.f.message)
         self.assertEqual(list(self.f.update_http_hosts.values()), [
-            "api.github.com", "github.com",
+            "api.github.com", "api.github.com",
         ])
+        self.assertFalse(list(self.path.glob("plugins/yiyan.koplugin/.yiyan-update-*")))
+
+        self.lua.execute("f.update_http_hosts = {}; f.update_tls_hosts = {}")
+        self.f.update_redirect_url = (
+            "https://github.com/iamzhangjinpeng/yiyan.koplugin/releases/download/"
+            "v1.5.0/yiyan.koplugin-v1.5.0-install.zip"
+        )
+        self.update_menu_item().callback()
+        self.f.drain(self.f)
+        self.f.confirm.ok_callback()
+        self.f.drain(self.f)
+        self.assertIn("跳转异常", self.f.message)
+        self.assertEqual(list(self.f.update_http_hosts.values()), [
+            "api.github.com", "api.github.com",
+        ])
+        self.assertFalse(self.f.github_asset_requests or False)
+
+    def test_online_update_rejects_asset_digest_mismatch_before_install(self):
+        payload = self.release_payload()
+        payload["assets"][0]["digest"] = "sha256:" + "0" * 64
+        self.f.update_release_body = json.dumps(payload)
+        self.update_menu_item().callback()
+        self.f.drain(self.f)
+        self.f.confirm.ok_callback()
+        self.f.drain(self.f)
+        self.assertIn("SHA-256 校验失败", self.f.message)
+        self.assertFalse(self.f.restarted or False)
         self.assertFalse(list(self.path.glob("plugins/yiyan.koplugin/.yiyan-update-*")))
 
     def test_online_update_reports_transport_timeout(self):

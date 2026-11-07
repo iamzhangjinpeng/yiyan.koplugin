@@ -1,9 +1,9 @@
 -- Online release updater for yiyan.koplugin.
 
 local Updater = {
-    VERSION = "1.4.3",
+    VERSION = "1.4.4",
     RELEASE_API = "https://api.github.com/repos/iamzhangjinpeng/yiyan.koplugin/releases/latest",
-    RELEASE_BASE = "https://github.com/iamzhangjinpeng/yiyan.koplugin/releases/download/",
+    RELEASE_ASSET_API_BASE = "https://api.github.com/repos/iamzhangjinpeng/yiyan.koplugin/releases/assets/",
     MAX_PACKAGE_SIZE = 2 * 1024 * 1024,
 }
 
@@ -58,18 +58,26 @@ function Updater.releaseToInstall(release, installed_version)
     if not Updater.isNewer(version, installed_version) then return nil, "up_to_date" end
 
     local expected_name = "yiyan.koplugin-v" .. version .. "-install.zip"
-    local expected_url = Updater.RELEASE_BASE .. tag .. "/" .. expected_name
     local assets = release.assets
     if type(assets) ~= "table" or type(assets[1]) ~= "table" then return nil, "missing_asset" end
     for _, asset in ipairs(assets) do
-        if type(asset) == "table" and asset.name == expected_name
-            and asset.browser_download_url == expected_url then
+        if type(asset) == "table" and asset.name == expected_name then
             local size = tonumber(asset.size)
-            if not size or size <= 0 or size > Updater.MAX_PACKAGE_SIZE then
+            if not size or size % 1 ~= 0 or size <= 0 or size > Updater.MAX_PACKAGE_SIZE then
                 return nil, "invalid_asset_size"
             end
+            local id = asset.id
+            if type(id) ~= "number" or id % 1 ~= 0 or id <= 0 or id >= 2 ^ 53 then
+                return nil, "invalid_asset_id"
+            end
+            local asset_id = string.format("%.0f", id)
+            local asset_url = Updater.RELEASE_ASSET_API_BASE .. asset_id
+            if asset.url ~= asset_url then return nil, "missing_asset" end
+            local digest = type(asset.digest) == "string" and asset.digest:match("^sha256:(%x+)$")
+            if not digest or #digest ~= 64 then return nil, "invalid_asset_digest" end
+            if asset.state ~= "uploaded" then return nil, "missing_asset" end
             return { version = version, tag = tag, name = expected_name,
-                url = expected_url, size = size }
+                url = asset_url, size = size, id = asset_id, digest = digest:lower() }
         end
     end
     return nil, "missing_asset"
@@ -91,8 +99,8 @@ local function allowedHost(host, path, asset)
     if not asset then
         return host == "api.github.com" and path == "/repos/iamzhangjinpeng/yiyan.koplugin/releases/latest"
     end
-    if host == "github.com" then
-        return path:match("^/iamzhangjinpeng/yiyan%.koplugin/releases/download/v%d+%.%d+%.%d+/yiyan%.koplugin%-v%d+%.%d+%.%d+%-install%.zip$") ~= nil
+    if host == "api.github.com" then
+        return path:match("^/repos/iamzhangjinpeng/yiyan%.koplugin/releases/assets/%d+$") ~= nil
     end
     return host == "release-assets.githubusercontent.com" or host == "objects.githubusercontent.com"
 end

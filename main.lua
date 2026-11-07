@@ -604,9 +604,11 @@ local function updateFailureMessage(err, checking)
     if err == "package_size_mismatch" then return _("安装包大小校验失败，当前版本未更改") end
     if err == "cannot_write_package" then return _("无法保存安装包，请检查插件目录空间和权限") end
     if err == "invalid_release" or err == "invalid_version" or err == "missing_asset"
-            or err == "invalid_asset_size" then
+            or err == "invalid_asset_size" or err == "invalid_asset_id" or err == "invalid_asset_digest" then
         return _("GitHub 发布信息或安装包无效，当前版本未更改")
     end
+    if err == "package_digest_mismatch" then return _("安装包 SHA-256 校验失败，当前版本未更改") end
+    if err == "package_digest_failed" then return _("无法校验安装包 SHA-256，当前版本未更改") end
     local status = type(err) == "string" and err:match("^http_(%d+)$")
     if status then return _("GitHub 返回 HTTP ") .. status .. (checking and "" or _("，下载未完成")) end
     return checking and _("检查更新失败，请确认网络能访问 GitHub 后重试")
@@ -653,7 +655,8 @@ function Yiyan:checkForUpdate()
             return
         end
         local update = Updater.releaseToInstall({ tag_name = plan.tag,
-            assets = {{ name = plan.name, browser_download_url = plan.url, size = plan.size }} },
+            assets = {{ name = plan.name, url = plan.url, size = plan.size, id = tonumber(plan.id),
+                digest = "sha256:" .. tostring(plan.digest or ""), state = "uploaded" }} },
             Updater.VERSION)
         if not update then
             updateMessage(self, _("没有找到可用的正式安装包，请稍后再试"))
@@ -693,6 +696,9 @@ function Yiyan:downloadUpdate(update)
             Updater.MAX_PACKAGE_SIZE, update.size), true)
         if not data then return nil, fetch_error end
         if #data ~= update.size then return nil, "package_size_mismatch" end
+        local hash_ok, digest = pcall(function() return require("ffi/sha2").sha256(data) end)
+        if not hash_ok or type(digest) ~= "string" then return nil, "package_digest_failed" end
+        if digest:lower() ~= update.digest then return nil, "package_digest_mismatch" end
         local file = io.open(zip_path, "wb")
         if not file then return nil, "cannot_write_package" end
         local written, write_error = file:write(data)
