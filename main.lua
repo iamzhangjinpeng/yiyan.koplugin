@@ -1100,7 +1100,8 @@ function Yiyan:refreshDaily(show_message, fetch_new, local_only)
     local now = os.time()
     local deadline, limited = retryWindow(marker, history[date], now)
     if limited then
-        notify(_("一言服务暂时限流，稍后会自动重试"))
+        notify(prior_success and _("一言服务暂时限流，冷却结束后请手动重试")
+            or _("一言服务暂时限流，冷却结束后会自动重试"))
         return
     end
     if now < deadline then

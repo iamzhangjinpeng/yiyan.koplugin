@@ -1,7 +1,7 @@
 -- Online release updater for yiyan.koplugin.
 
 local Updater = {
-    VERSION = "1.4.0",
+    VERSION = "1.4.1",
     RELEASE_API = "https://api.github.com/repos/iamzhangjinpeng/yiyan.koplugin/releases/latest",
     RELEASE_BASE = "https://github.com/iamzhangjinpeng/yiyan.koplugin/releases/download/",
     MAX_PACKAGE_SIZE = 2 * 1024 * 1024,

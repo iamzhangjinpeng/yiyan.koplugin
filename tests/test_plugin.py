@@ -347,11 +347,12 @@ class PluginTests(unittest.TestCase):
 
     def prepare_update_package(self, version="1.5.0", omit=None, bad_path=None):
         files = {}
+        installed_version = str(self.lua.globals().updater.VERSION)
         for relative in self.lua.globals().updater.FILES.values():
             path = ROOT / relative
             data = path.read_bytes()
             if relative in {"_meta.lua", "updater.lua"}:
-                data = data.replace(b'"1.4.0"', ('"' + version + '"').encode())
+                data = data.replace(('"' + installed_version + '"').encode(), ('"' + version + '"').encode())
             files["yiyan.koplugin/" + relative] = data
         self.archive_files = files
         entries = []
